@@ -1278,7 +1278,7 @@ struct BtnInfo {
 
 struct Ui {
     HWND drives, refresh, driveinfo, version, archives, site, cache, source, sha, drop, progress, status, detail;
-    HWND start, cancel, format, eject, log, tip;
+    HWND start, cancel, format, eject, log, tip, scroll;
     HFONT font = nullptr, semi = nullptr, title = nullptr, small = nullptr, mono = nullptr, icon = nullptr, iconBig = nullptr;
     HBRUSH bgBrush = nullptr, cardBrush = nullptr, fieldBrush = nullptr;
     HICON appIcon = nullptr;
@@ -1810,6 +1810,8 @@ static void make_fonts() {
     ui.appIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, S(30), S(30), 0);
 }
 
+static bool sb_update();
+
 static void layout() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
@@ -1850,9 +1852,12 @@ static void layout() {
     RECT& c3 = ui.cards[3];
     c3 = {m, y, m + cw, std::max(y + S(110), (int)rc.bottom - m)};
     ui.logField = {x - S(4), c3.top + S(44), c3.right - pad + S(4), c3.bottom - S(12)};
-    place(ui.log, ui.logField.left + S(8), ui.logField.top + S(6), ui.logField.right - ui.logField.left - S(10), ui.logField.bottom - ui.logField.top - S(10));
+    int lw = ui.logField.right - ui.logField.left, lh = ui.logField.bottom - ui.logField.top;
+    place(ui.log, ui.logField.left + S(8), ui.logField.top + S(6), lw - S(8) - S(16), lh - S(10));
+    place(ui.scroll, ui.logField.right - S(14), ui.logField.top + S(4), S(12), lh - S(8));
     InvalidateRect(g_hwnd, nullptr, TRUE);
     RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE);
+    if (ui.scroll) sb_update();
 }
 
 static void paint(HDC hdc) {
@@ -2132,6 +2137,139 @@ static LRESULT CALLBACK BtnProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, 
     return DefSubclassProc(h, m, wp, lp);
 }
 
+struct ScrollState {
+    int total = 1, first = 0, visible = 1;
+    bool hot = false, drag = false;
+    int grab = 0;
+} g_sb;
+
+static int log_line_height() {
+    HDC dc = GetDC(ui.log);
+    HGDIOBJ o = SelectObject(dc, ui.mono);
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, o);
+    ReleaseDC(ui.log, dc);
+    return std::max(1, (int)tm.tmHeight);
+}
+
+static bool sb_update() {
+    RECT r;
+    GetClientRect(ui.log, &r);
+    int total = std::max(1, (int)SendMessageW(ui.log, EM_GETLINECOUNT, 0, 0));
+    int first = (int)SendMessageW(ui.log, EM_GETFIRSTVISIBLELINE, 0, 0);
+    int visible = std::max(1, (int)(r.bottom - r.top) / log_line_height());
+    bool changed = total != g_sb.total || first != g_sb.first || visible != g_sb.visible;
+    g_sb.total = total;
+    g_sb.first = first;
+    g_sb.visible = visible;
+    if (changed && ui.scroll) InvalidateRect(ui.scroll, nullptr, FALSE);
+    return changed;
+}
+
+static bool sb_thumb(RECT& t) {
+    RECT r;
+    GetClientRect(ui.scroll, &r);
+    int h = r.bottom - r.top;
+    if (g_sb.total <= g_sb.visible || h <= 0) return false;
+    int th = std::max(S(28), h * g_sb.visible / g_sb.total);
+    int range = std::max(1, g_sb.total - g_sb.visible);
+    int y = (h - th) * std::min(g_sb.first, range) / range;
+    t = {0, y, r.right, y + th};
+    return true;
+}
+
+static void sb_scroll_to(int line) {
+    int range = std::max(0, g_sb.total - g_sb.visible);
+    line = std::max(0, std::min(range, line));
+    int first = (int)SendMessageW(ui.log, EM_GETFIRSTVISIBLELINE, 0, 0);
+    if (line != first) SendMessageW(ui.log, EM_LINESCROLL, 0, line - first);
+    sb_update();
+}
+
+static LRESULT CALLBACK ScrollProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        {
+            MemDC mem(hdc, rc.right, rc.bottom);
+            fill(mem.dc, rc, C::field);
+            RECT t;
+            if (sb_thumb(t)) {
+                bool big = g_sb.hot || g_sb.drag;
+                int w = big ? S(6) : S(4);
+                RECT p{rc.right - S(3) - w, t.top + S(2), rc.right - S(3), t.bottom - S(2)};
+                rrect(mem.dc, p, w / 2, g_sb.drag ? RGB(120, 130, 150) : big ? RGB(92, 100, 118) : RGB(58, 64, 78), CLR_NONE);
+            }
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEMOVE: {
+        if (!g_sb.hot) {
+            g_sb.hot = true;
+            TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0};
+            TrackMouseEvent(&t);
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        if (g_sb.drag) {
+            RECT rc, t;
+            GetClientRect(h, &rc);
+            if (sb_thumb(t)) {
+                int th = t.bottom - t.top, track = std::max(1, (int)rc.bottom - th);
+                int y = GET_Y_LPARAM(lp) - g_sb.grab;
+                sb_scroll_to((int)((long long)y * (g_sb.total - g_sb.visible) / track));
+            }
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_sb.hot = false;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
+        RECT t;
+        if (!sb_thumb(t)) return 0;
+        int y = GET_Y_LPARAM(lp);
+        if (y >= t.top && y < t.bottom) {
+            g_sb.drag = true;
+            g_sb.grab = y - t.top;
+            SetCapture(h);
+        } else sb_scroll_to(g_sb.first + (y < t.top ? -g_sb.visible : g_sb.visible));
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        if (g_sb.drag) {
+            g_sb.drag = false;
+            if (m == WM_LBUTTONUP) ReleaseCapture();
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        return SendMessageW(ui.log, m, wp, lp);
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+static LRESULT CALLBACK LogProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    LRESULT r = DefSubclassProc(h, m, wp, lp);
+    switch (m) {
+    case WM_MOUSEWHEEL: case WM_KEYDOWN: case WM_VSCROLL: case WM_SIZE: case WM_MOUSEMOVE: case WM_LBUTTONDOWN:
+    case EM_REPLACESEL: case EM_SCROLLCARET: case EM_LINESCROLL: case WM_SETTEXT: case WM_SETFONT: case EM_SETSEL:
+        sb_update();
+        break;
+    }
+    return r;
+}
+
 static HWND mk(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD ex = 0) {
     return CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, g_hwnd, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
 }
@@ -2187,7 +2325,16 @@ static void create_controls() {
     ui.progress = mk(WC_STATICW, L"", SS_OWNERDRAW, IDC_PROGRESS);
     ui.start = mkbtn(L"Préparer la clé", IDC_START, BK_PRIMARY, 0xE88E);
     ui.cancel = mkbtn(L"Annuler", IDC_CANCEL, BK_GHOST, 0xE711);
-    ui.log = mk(WC_EDITW, L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, IDC_LOG);
+    ui.log = mk(WC_EDITW, L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG);
+    SetWindowSubclass(ui.log, LogProc, 3, 0);
+    WNDCLASSW sc{};
+    sc.lpfnWndProc = ScrollProc;
+    sc.hInstance = GetModuleHandleW(nullptr);
+    sc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    sc.style = CS_DBLCLKS;
+    sc.lpszClassName = L"PSDScrollBar";
+    RegisterClassW(&sc);
+    ui.scroll = mk(L"PSDScrollBar", L"", 0, 0);
     SendMessageW(ui.log, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
     SendMessageW(ui.log, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(2, 2));
     for (HWND cb : {ui.drives, ui.version}) {
@@ -2196,7 +2343,6 @@ static void create_controls() {
         COMBOBOXINFO ci{sizeof ci};
         if (GetComboBoxInfo(cb, &ci) && ci.hwndList) dark(ci.hwndList, L"DarkMode_Explorer");
     }
-    dark(ui.log, L"DarkMode_Explorer");
     ui.tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, 0, 0, 0, 0, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     dark(ui.tip, L"DarkMode_Explorer");
     add_tip(ui.refresh, L"Rechercher les clés USB");
