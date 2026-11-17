@@ -1,3 +1,5 @@
 build/
 *.exe
 *.res
+*.pem
+__pycache__/

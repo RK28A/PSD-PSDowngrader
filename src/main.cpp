@@ -32,6 +32,8 @@
 #include <memory>
 #include <functional>
 #include <map>
+#include <mutex>
+#include <set>
 #include <regex>
 #include <string>
 #include <thread>
@@ -45,8 +47,8 @@
 #endif
 
 static const wchar_t* APP_NAME = L"PSD";
-static const wchar_t* APP_VER = L"2.2";
-static const wchar_t* UA = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) PSD/2.2";
+static const wchar_t* APP_VER = L"2.3";
+static const wchar_t* UA = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) PSD/2.3";
 static const wchar_t* D_ARCHIVE = L"https://darthsternie.net/ps5-firmwares/";
 static const wchar_t* M_ARCHIVE = L"https://archive.midnightchannel.net/SonyPS/Firmware/index.php?cat=PS5SYS";
 static const uint64_t MiB = 1024ull * 1024ull;
@@ -56,7 +58,7 @@ static const DWORD BLOCK = 4 * 1024 * 1024;
 static const GUID kDiskGuid = {0x53f56307, 0xb6bf, 0x11d0, {0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b}};
 
 enum {
-    WM_LOGMSG = WM_APP + 1, WM_PROG, WM_DRIVES, WM_CATALOG, WM_DONE, WM_IDENT
+    WM_LOGMSG = WM_APP + 1, WM_PROG, WM_DRIVES, WM_CATALOG, WM_DONE, WM_IDENT, WM_STEP, WM_NOCANCEL
 };
 enum {
     IDC_DRIVES = 100, IDC_REFRESH, IDC_DRIVEINFO, IDC_VERSION, IDC_ARCHIVES, IDC_SITE, IDC_SOURCE, IDC_SHA,
@@ -155,22 +157,75 @@ static std::atomic<bool> g_cancel{false};
 static std::atomic<bool> g_busy{false};
 static std::atomic<bool> g_scanning{false};
 static std::atomic<bool> g_catalog_loading{false};
+static std::atomic<bool> g_device_lost{false};
+static std::atomic<bool> g_nocancel{false};
+static std::atomic<int> g_step{-1};
 static HINTERNET g_session;
 static std::wstring g_cache, g_exe_dir;
+
+#ifdef PSD_TEST
+static uint64_t g_test_fail_after = 0;
+static DWORD g_test_fail_code = 0;
+static uint64_t g_test_cancel_after = 0;
+static bool g_test_fast = false;
+static bool g_test_insecure = false;
+static std::wstring g_test_prefix;
+#endif
 
 static void check_cancel() {
     if (g_cancel) throw Cancelled{L"Opération annulée. Le téléchargement partiel est conservé."};
 }
 
-static void post_log(const std::wstring& s) { PostMessageW(g_hwnd, WM_LOGMSG, 0, (LPARAM) new std::wstring(s)); }
+template <class T> static void post_obj(UINT msg, T* p) {
+    HWND h = g_hwnd;
+    if (!h || !PostMessageW(h, msg, 0, (LPARAM)p)) delete p;
+}
+
+static void post_log(const std::wstring& s) { post_obj(WM_LOGMSG, new std::wstring(s)); }
 
 struct Prog {
     std::wstring phase, detail;
     uint64_t cur = 0, total = 0;
 };
 
-static void post_prog(const std::wstring& phase, uint64_t cur, uint64_t total, const std::wstring& detail) {
-    PostMessageW(g_hwnd, WM_PROG, 0, (LPARAM) new Prog{phase, detail, cur, total});
+static void post_prog(const std::wstring& phase, uint64_t cur, uint64_t total, const std::wstring& detail) { post_obj(WM_PROG, new Prog{phase, detail, cur, total}); }
+
+static void set_step(int s) {
+    g_step = s;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_STEP, 0, 0);
+}
+
+struct Task {
+    std::thread t;
+    std::shared_ptr<std::atomic<bool>> done;
+};
+static std::mutex g_tasks_mtx;
+static std::vector<Task> g_tasks;
+
+static void spawn(std::function<void()> fn) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::lock_guard<std::mutex> l(g_tasks_mtx);
+    for (auto it = g_tasks.begin(); it != g_tasks.end();) {
+        if (*it->done) {
+            it->t.join();
+            it = g_tasks.erase(it);
+        } else ++it;
+    }
+    g_tasks.push_back({std::thread([fn, done] {
+                           fn();
+                           *done = true;
+                       }),
+                       done});
+}
+
+static void join_all() {
+    std::vector<Task> v;
+    {
+        std::lock_guard<std::mutex> l(g_tasks_mtx);
+        v.swap(g_tasks);
+    }
+    for (auto& t : v)
+        if (t.t.joinable()) t.t.join();
 }
 
 struct Meter {
@@ -207,7 +262,12 @@ struct Firmware {
     std::string sha256, md5;
     uint64_t size = 0;
     std::wstring direct, mega;
+    std::vector<std::wstring> refs;
 };
+
+static void add_ref(Firmware& f, const std::wstring& r) {
+    if (std::find(f.refs.begin(), f.refs.end(), r) == f.refs.end()) f.refs.push_back(r);
+}
 using Catalog = std::map<std::wstring, Firmware>;
 
 static bool is_hex(const std::string& s, size_t n) {
@@ -245,6 +305,7 @@ static Catalog builtin_catalog() {
         f.md5 = md5;
         f.size = size;
         f.direct = direct;
+        f.refs.push_back(L"référence intégrée");
         c[v] = f;
     };
     add(L"13.60.00", "767a94eac034d33907a6ff57af05bc30ce057258ad1cf4b5ffb75d5e21112561", "06a74efce009503170b7add7fecfeb36",
@@ -258,8 +319,14 @@ static Catalog builtin_catalog() {
 
 static bool allowed_download(const std::wstring& url) {
     std::wstring l = wlower(url);
-    const std::wstring pre = L"https://archive.midnightchannel.net/sonyps/firmware/download/";
-    if (l.compare(0, pre.size(), pre) != 0) return false;
+    std::vector<std::wstring> pre = {L"https://archive.midnightchannel.net/sonyps/firmware/download/"};
+#ifdef PSD_TEST
+    if (!g_test_prefix.empty()) pre.push_back(wlower(g_test_prefix));
+#endif
+    bool ok = false;
+    for (auto& p : pre)
+        if (l.compare(0, p.size(), p) == 0) ok = true;
+    if (!ok) return false;
     size_t q = l.find_first_of(L"?#");
     std::wstring path = l.substr(0, q);
     return path.size() > 4 && path.compare(path.size() - 4, 4, L".pup") == 0;
@@ -273,6 +340,22 @@ static std::wstring url_host(const std::wstring& url) {
     uc.dwHostNameLength = 256;
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return {};
     return wlower(host);
+}
+
+static bool host_allowed(const std::wstring& url, const std::vector<std::wstring>& hosts) {
+    if (wlower(url).rfind(L"https://", 0) != 0) return false;
+    std::wstring h = url_host(url);
+    for (auto& a : hosts)
+        if (!h.empty() && h == wlower(a)) return true;
+    return false;
+}
+
+static std::vector<std::wstring> download_hosts() {
+    std::vector<std::wstring> h = {L"archive.midnightchannel.net"};
+#ifdef PSD_TEST
+    if (!g_test_prefix.empty()) h.push_back(url_host(g_test_prefix));
+#endif
+    return h;
 }
 
 static void http_init() {
@@ -289,14 +372,42 @@ static void http_init() {
     WinHttpSetTimeouts(g_session, 15000, 15000, 30000, 35000);
 }
 
+static std::wstring url_join(const std::wstring& base, const std::string& link8) {
+    std::wstring link = W(link8);
+    if (link.rfind(L"http://", 0) == 0 || link.rfind(L"https://", 0) == 0) return link;
+    if (link.rfind(L"//", 0) == 0) return L"https:" + link;
+    size_t sch = base.find(L"://");
+    size_t host_end = base.find(L'/', sch + 3);
+    std::wstring origin = base.substr(0, host_end);
+    if (!link.empty() && link[0] == L'/') return origin + link;
+    std::wstring nq = base.substr(0, base.find_first_of(L"?#"));
+    if (!link.empty() && link[0] == L'?') return nq + link;
+    if (!link.empty() && link[0] == L'#') return base + link;
+    return nq.substr(0, nq.rfind(L'/') + 1) + link;
+}
+
+struct Req;
+static std::mutex g_req_mtx;
+static std::set<Req*> g_reqs;
+
 struct Req {
     HINTERNET c = nullptr, r = nullptr;
     DWORD status = 0;
+    std::wstring url;
+    bool aborted = false;
     Req() = default;
     Req(const Req&) = delete;
-    ~Req() {
-        if (r) WinHttpCloseHandle(r);
+    ~Req() { close(); }
+    void close() {
+        {
+            std::lock_guard<std::mutex> l(g_req_mtx);
+            g_reqs.erase(this);
+            if (r && !aborted) WinHttpCloseHandle(r);
+            r = nullptr;
+            aborted = false;
+        }
         if (c) WinHttpCloseHandle(c);
+        c = nullptr;
     }
     std::wstring header(DWORD q) {
         DWORD len = 0;
@@ -307,55 +418,94 @@ struct Req {
         s.resize(len / sizeof(wchar_t));
         return s;
     }
-    std::wstring final_url() {
-        DWORD len = 0;
-        WinHttpQueryOption(r, WINHTTP_OPTION_URL, nullptr, &len);
-        if (!len) return {};
-        std::wstring s(len / sizeof(wchar_t) + 1, 0);
-        if (!WinHttpQueryOption(r, WINHTTP_OPTION_URL, s.data(), &len)) return {};
-        s.resize(wcslen(s.c_str()));
-        return s;
-    }
 };
 
-static void http_open(Req& q, const std::wstring& url, const std::wstring& headers) {
-    if (!g_session) fail(L"WinHTTP indisponible sur ce PC");
-    URL_COMPONENTS uc{};
-    uc.dwStructSize = sizeof uc;
-    std::vector<wchar_t> host(512), path(8192), extra(8192);
-    uc.lpszHostName = host.data();
-    uc.dwHostNameLength = 512;
-    uc.lpszUrlPath = path.data();
-    uc.dwUrlPathLength = 8192;
-    uc.lpszExtraInfo = extra.data();
-    uc.dwExtraInfoLength = 8192;
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) fail(L"Adresse invalide : " + url);
-    if (uc.nScheme != INTERNET_SCHEME_HTTPS) fail(L"HTTPS obligatoire : " + url);
-    q.c = WinHttpConnect(g_session, host.data(), uc.nPort, 0);
-    if (!q.c) fail(L"Connexion impossible : " + win_error(GetLastError()), false);
-    std::wstring object = std::wstring(path.data()) + extra.data();
-    q.r = WinHttpOpenRequest(q.c, L"GET", object.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!q.r) fail(L"Requête impossible : " + win_error(GetLastError()), false);
-    BOOL ok = headers.empty()
-                  ? WinHttpSendRequest(q.r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
-                  : WinHttpSendRequest(q.r, headers.c_str(), (DWORD)headers.size(), WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    if (!ok || !WinHttpReceiveResponse(q.r, nullptr)) fail(L"Réseau : " + win_error(GetLastError()), false);
-    DWORD st = 0, sz = sizeof st;
-    WinHttpQueryHeaders(q.r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz, WINHTTP_NO_HEADER_INDEX);
-    q.status = st;
-    std::wstring fin = wlower(q.final_url());
-    if (!fin.empty() && fin.rfind(L"https://", 0) != 0) fail(L"Redirection non sécurisée refusée");
+static void abort_network() {
+    std::lock_guard<std::mutex> l(g_req_mtx);
+    for (Req* q : g_reqs) {
+        if (q->r && !q->aborted) WinHttpCloseHandle(q->r);
+        q->aborted = true;
+    }
 }
 
-static std::string http_text(const std::wstring& url) {
+static bool http_read(Req& q, void* buf, DWORD size, DWORD& got) {
+    got = 0;
+    if (q.aborted) return false;
+    return WinHttpReadData(q.r, buf, size, &got) != FALSE;
+}
+
+static void http_open(Req& q, std::wstring url, const std::wstring& headers, std::vector<std::wstring> hosts = {}) {
+    if (!g_session) fail(L"WinHTTP indisponible sur ce PC");
+    if (hosts.empty()) hosts.push_back(url_host(url));
+    for (int hop = 0; hop < 6; hop++) {
+        check_cancel();
+        if (!host_allowed(url, hosts)) fail(L"Destination refusée (HTTPS et domaine autorisé obligatoires) : " + url);
+        q.close();
+        URL_COMPONENTS uc{};
+        uc.dwStructSize = sizeof uc;
+        std::vector<wchar_t> host(512), path(8192), extra(8192);
+        uc.lpszHostName = host.data();
+        uc.dwHostNameLength = 512;
+        uc.lpszUrlPath = path.data();
+        uc.dwUrlPathLength = 8192;
+        uc.lpszExtraInfo = extra.data();
+        uc.dwExtraInfoLength = 8192;
+        if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) fail(L"Adresse invalide : " + url);
+        if (uc.nScheme != INTERNET_SCHEME_HTTPS) fail(L"HTTPS obligatoire : " + url);
+        q.c = WinHttpConnect(g_session, host.data(), uc.nPort, 0);
+        if (!q.c) fail(L"Connexion impossible : " + win_error(GetLastError()), false);
+        std::wstring object = std::wstring(path.data()) + extra.data();
+        q.r = WinHttpOpenRequest(q.c, L"GET", object.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!q.r) fail(L"Requête impossible : " + win_error(GetLastError()), false);
+        DWORD feat = WINHTTP_DISABLE_REDIRECTS;
+        WinHttpSetOption(q.r, WINHTTP_OPTION_DISABLE_FEATURE, &feat, sizeof feat);
+#ifdef PSD_TEST
+        if (g_test_insecure) {
+            DWORD sec = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+            WinHttpSetOption(q.r, WINHTTP_OPTION_SECURITY_FLAGS, &sec, sizeof sec);
+        }
+#endif
+        {
+            std::lock_guard<std::mutex> l(g_req_mtx);
+            g_reqs.insert(&q);
+        }
+        check_cancel();
+        BOOL ok = headers.empty() ? WinHttpSendRequest(q.r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+                                  : WinHttpSendRequest(q.r, headers.c_str(), (DWORD)headers.size(), WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+        if (!ok || !WinHttpReceiveResponse(q.r, nullptr)) {
+            DWORD e = GetLastError();
+            check_cancel();
+            fail(L"Réseau : " + win_error(e), false);
+        }
+        DWORD st = 0, sz = sizeof st;
+        WinHttpQueryHeaders(q.r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz, WINHTTP_NO_HEADER_INDEX);
+        q.status = st;
+        q.url = url;
+        if (st == 301 || st == 302 || st == 303 || st == 307 || st == 308) {
+            std::wstring loc = trim(q.header(WINHTTP_QUERY_LOCATION));
+            if (loc.empty()) fail(F(L"Redirection HTTP %lu sans destination", st));
+            std::wstring next = url_join(url, U(loc));
+            if (!host_allowed(next, hosts)) fail(L"Redirection refusée vers un domaine non autorisé : " + next);
+            url = next;
+            continue;
+        }
+        return;
+    }
+    fail(L"Trop de redirections");
+}
+
+static std::string http_text(const std::wstring& url, const std::vector<std::wstring>& hosts) {
     Req q;
-    http_open(q, url, L"Accept: text/html,application/xhtml+xml\r\n");
+    http_open(q, url, L"Accept: text/html,application/xhtml+xml\r\n", hosts);
     if (q.status != 200) fail(F(L"HTTP %lu", q.status));
     std::string body;
     std::vector<char> buf(65536);
     while (body.size() < 6 * MiB) {
         DWORD got = 0;
-        if (!WinHttpReadData(q.r, buf.data(), (DWORD)buf.size(), &got)) fail(L"Lecture réseau : " + win_error(GetLastError()));
+        if (!http_read(q, buf.data(), (DWORD)buf.size(), got)) {
+            check_cancel();
+            fail(L"Lecture réseau : " + win_error(GetLastError()));
+        }
         if (!got) break;
         body.append(buf.data(), got);
     }
@@ -500,19 +650,6 @@ static std::vector<Row> parse_tables(const std::string& h) {
     return rows;
 }
 
-static std::wstring url_join(const std::wstring& base, const std::string& link8) {
-    std::wstring link = W(link8);
-    if (link.rfind(L"http://", 0) == 0 || link.rfind(L"https://", 0) == 0) return link;
-    if (link.rfind(L"//", 0) == 0) return L"https:" + link;
-    size_t sch = base.find(L"://");
-    size_t host_end = base.find(L'/', sch + 3);
-    std::wstring origin = base.substr(0, host_end);
-    if (!link.empty() && link[0] == L'/') return origin + link;
-    std::wstring nq = base.substr(0, base.find_first_of(L"?#"));
-    if (!link.empty() && link[0] == L'?') return nq + link;
-    if (!link.empty() && link[0] == L'#') return base + link;
-    return nq.substr(0, nq.rfind(L'/') + 1) + link;
-}
 
 static std::string find_hex(const std::vector<Cell>& cells, size_t len) {
     std::regex re("(?:^|[^0-9a-fA-F])([0-9a-fA-F]{" + std::to_string(len) + "})(?:[^0-9a-fA-F]|$)");
@@ -533,69 +670,176 @@ static std::wstring find_version(const std::vector<Cell>& cells, const std::stri
     return {};
 }
 
+struct VersionMark {
+    size_t pos;
+    std::wstring v;
+};
+
+static std::vector<VersionMark> version_marks(const std::string& html) {
+    static const std::regex re(R"((?:firmware|system\s*software|version|ver\.?)\s*:?\s*(\d{1,2}\.\d{2}(?:\.\d{2})?)(?![\d.]))", std::regex::icase);
+    std::vector<VersionMark> v;
+    for (auto it = std::sregex_iterator(html.begin(), html.end(), re); it != std::sregex_iterator(); ++it) {
+        std::wstring n = normalize_version((*it)[1].str());
+        if (!n.empty()) v.push_back({(size_t)it->position(0), n});
+    }
+    return v;
+}
+
+static std::wstring version_before(const std::vector<VersionMark>& marks, const std::string& lhtml, size_t pos) {
+    const VersionMark* best = nullptr;
+    for (auto& m : marks)
+        if (m.pos < pos && pos - m.pos < 4000) best = &m;
+    if (!best) return {};
+    std::string between = lhtml.substr(best->pos, pos - best->pos);
+    if (between.find("recovery") != std::string::npos || between.find("sys_ex") != std::string::npos) return {};
+    return best->v;
+}
+
+static int parse_darthsternie(const std::string& html, Catalog& out) {
+    int count = 0;
+    for (auto& r : parse_tables(html)) {
+        if (r.section == "recovery") continue;
+        std::string joined;
+        for (auto& c : r.cells) joined += c.text + " ";
+        std::string lj = lower(joined);
+        if (lj.find("recovery") != std::string::npos || lj.find("sys_ex") != std::string::npos) continue;
+        std::wstring v = find_version(r.cells, joined);
+        if (v.empty()) continue;
+        Firmware& f = out[v];
+        f.version = v;
+        std::string md5 = find_hex(r.cells, 32);
+        if (!md5.empty()) {
+            if (!f.md5.empty() && f.md5 != md5) post_log(L"MD5 contradictoire pour " + v + L" : valeur intégrée conservée");
+            else {
+                f.md5 = md5;
+                add_ref(f, L"Darthsternie (MD5)");
+            }
+        }
+        for (auto& c : r.cells)
+            for (auto& l : c.links) {
+                std::wstring u = url_join(D_ARCHIVE, l);
+                if (url_host(u) == L"mega.nz" && f.mega.empty()) f.mega = u;
+            }
+        count++;
+    }
+    std::string lh = lower(html);
+    auto marks = version_marks(html);
+    static const std::regex mega_re(R"(https://mega\.nz/(?:file|folder)/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+)");
+    int extra = 0;
+    for (auto it = std::sregex_iterator(html.begin(), html.end(), mega_re); it != std::sregex_iterator(); ++it) {
+        std::wstring v = version_before(marks, lh, (size_t)it->position(0));
+        if (v.empty()) continue;
+        Firmware& f = out[v];
+        f.version = v;
+        if (f.mega.empty()) {
+            f.mega = W(it->str());
+            extra++;
+        }
+    }
+    if (extra) post_log(F(L"Darthsternie : %d lien(s) MEGA retrouvé(s) hors tableau", extra));
+    return count + extra;
+}
+
+static int parse_midnight(const std::string& html, Catalog& out) {
+    int count = 0;
+    for (auto& r : parse_tables(html)) {
+        if (r.section == "recovery") continue;
+        std::string joined;
+        for (auto& c : r.cells) joined += c.text + " ";
+        std::string lj = lower(joined);
+        if (lj.find("recovery") != std::string::npos || lj.find("sys_ex") != std::string::npos || lj.find("disc") != std::string::npos) continue;
+        std::wstring v = find_version(r.cells, joined);
+        if (v.empty()) continue;
+        std::string sha = find_hex(r.cells, 64);
+        auto it = out.find(v);
+        if (!sha.empty() && it != out.end() && !it->second.sha256.empty() && it->second.sha256 != sha) {
+            post_log(L"SHA-256 CONTRADICTOIRE pour " + v + L" : entrée distante ignorée");
+            continue;
+        }
+        Firmware& f = out[v];
+        f.version = v;
+        if (!sha.empty()) {
+            f.sha256 = sha;
+            add_ref(f, L"Midnight Channel");
+        }
+        for (auto& c : r.cells)
+            for (auto& l : c.links) {
+                std::wstring u = url_join(M_ARCHIVE, l);
+                if (allowed_download(u)) {
+                    f.direct = u;
+                    break;
+                }
+            }
+        count++;
+    }
+    std::string lh = lower(html);
+    auto marks = version_marks(html);
+    static const std::regex link_re(R"rx(href\s*=\s*["']([^"']*/download/([0-9a-fA-F]{64})/[^"']*\.pup)["'])rx", std::regex::icase);
+    int extra = 0;
+    for (auto it = std::sregex_iterator(html.begin(), html.end(), link_re); it != std::sregex_iterator(); ++it) {
+        std::wstring u = url_join(M_ARCHIVE, decode_entities((*it)[1].str()));
+        if (!allowed_download(u)) continue;
+        std::string sha = lower((*it)[2].str());
+        Firmware* target = nullptr;
+        for (auto& kv : out)
+            if (kv.second.sha256 == sha) target = &kv.second;
+        if (!target) {
+            std::wstring v = version_before(marks, lh, (size_t)it->position(0));
+            if (v.empty()) continue;
+            auto ex = out.find(v);
+            if (ex != out.end() && !ex->second.sha256.empty() && ex->second.sha256 != sha) continue;
+            target = &out[v];
+            target->version = v;
+            target->sha256 = sha;
+            add_ref(*target, L"Midnight Channel");
+        }
+        if (target->direct.empty()) {
+            target->direct = u;
+            extra++;
+        }
+    }
+    if (extra) post_log(F(L"Midnight Channel : %d lien(s) HTTPS retrouvé(s) hors tableau", extra));
+    return count + extra;
+}
+
+static int load_user_refs(const std::string& js, Catalog& out) {
+    static const std::regex re(R"rx("(\d{1,2}\.\d{2}(?:\.\d{2})?)"\s*:\s*\{[^}]*?"sha256"\s*:\s*"([0-9a-fA-F]{64})")rx");
+    int added = 0;
+    for (auto it = std::sregex_iterator(js.begin(), js.end(), re); it != std::sregex_iterator(); ++it) {
+        std::wstring v = normalize_version((*it)[1].str());
+        std::string sha = lower((*it)[2].str());
+        if (v.empty()) continue;
+        Firmware& f = out[v];
+        f.version = v;
+        if (!f.sha256.empty() && f.sha256 != sha) post_log(L"Conflit SHA-256 sur " + v + L" (JSON perso) : référence connue conservée");
+        else {
+            if (f.sha256.empty()) f.sha256 = sha;
+            add_ref(f, L"sha256_references.json");
+            added++;
+        }
+    }
+    return added;
+}
+
 static Catalog scan_catalog() {
     Catalog out = builtin_catalog();
     try {
-        auto rows = parse_tables(http_text(D_ARCHIVE));
-        int count = 0;
-        for (auto& r : rows) {
-            if (r.section == "recovery") continue;
-            std::string joined;
-            for (auto& c : r.cells) joined += c.text + " ";
-            std::string lj = lower(joined);
-            if (lj.find("recovery") != std::string::npos || lj.find("sys_ex") != std::string::npos) continue;
-            std::wstring v = find_version(r.cells, joined);
-            if (v.empty()) continue;
-            Firmware& f = out[v];
-            f.version = v;
-            std::string md5 = find_hex(r.cells, 32);
-            if (!md5.empty()) {
-                if (!f.md5.empty() && f.md5 != md5) post_log(L"MD5 contradictoire pour " + v + L" : valeur intégrée conservée");
-                else f.md5 = md5;
-            }
-            for (auto& c : r.cells)
-                for (auto& l : c.links) {
-                    std::wstring u = url_join(D_ARCHIVE, l);
-                    if (url_host(u) == L"mega.nz" && f.mega.empty()) f.mega = u;
-                }
-            count++;
-        }
-        post_log(F(L"Darthsternie : %d version(s) recensée(s) (liens MEGA)", count));
+        int n = parse_darthsternie(http_text(D_ARCHIVE, {L"darthsternie.net", L"www.darthsternie.net"}), out);
+        post_log(F(L"Darthsternie : %d version(s) recensée(s) (liens MEGA)", n));
     } catch (AppError& e) {
         post_log(L"Darthsternie inaccessible : " + e.msg);
+    } catch (Cancelled&) {
+        return out;
     } catch (std::exception& e) {
         post_log(L"Darthsternie illisible : " + W(e.what()));
     }
     try {
-        auto rows = parse_tables(http_text(M_ARCHIVE));
-        int count = 0;
-        for (auto& r : rows) {
-            if (r.section == "recovery") continue;
-            std::string joined;
-            for (auto& c : r.cells) joined += c.text + " ";
-            std::string lj = lower(joined);
-            if (lj.find("recovery") != std::string::npos || lj.find("sys_ex") != std::string::npos || lj.find("disc") != std::string::npos) continue;
-            std::wstring v = find_version(r.cells, joined);
-            if (v.empty()) continue;
-            std::string sha = find_hex(r.cells, 64);
-            auto it = out.find(v);
-            if (!sha.empty() && it != out.end() && !it->second.sha256.empty() && it->second.sha256 != sha) {
-                post_log(L"SHA-256 CONTRADICTOIRE pour " + v + L" : entrée distante ignorée");
-                continue;
-            }
-            Firmware& f = out[v];
-            f.version = v;
-            if (!sha.empty()) f.sha256 = sha;
-            for (auto& c : r.cells)
-                for (auto& l : c.links) {
-                    std::wstring u = url_join(M_ARCHIVE, l);
-                    if (allowed_download(u)) { f.direct = u; break; }
-                }
-            count++;
-        }
-        post_log(F(L"Midnight Channel : %d version(s) recensée(s) (SHA-256 + HTTPS)", count));
+        int n = parse_midnight(http_text(M_ARCHIVE, {L"archive.midnightchannel.net"}), out);
+        post_log(F(L"Midnight Channel : %d version(s) recensée(s) (SHA-256 + HTTPS)", n));
     } catch (AppError& e) {
         post_log(L"Midnight Channel inaccessible : " + e.msg);
+    } catch (Cancelled&) {
+        return out;
     } catch (std::exception& e) {
         post_log(L"Midnight Channel illisible : " + W(e.what()));
     }
@@ -604,21 +848,10 @@ static Catalog scan_catalog() {
     if (h != INVALID_HANDLE_VALUE) {
         std::string js(256 * 1024, 0);
         DWORD got = 0;
-        ReadFile(h, js.data(), (DWORD)js.size(), &got, nullptr);
+        if (!ReadFile(h, js.data(), (DWORD)js.size(), &got, nullptr)) got = 0;
         CloseHandle(h);
         js.resize(got);
-        static const std::regex re(R"rx("(\d{1,2}\.\d{2}(?:\.\d{2})?)"\s*:\s*\{[^}]*?"sha256"\s*:\s*"([0-9a-fA-F]{64})")rx");
-        int added = 0;
-        for (auto it = std::sregex_iterator(js.begin(), js.end(), re); it != std::sregex_iterator(); ++it) {
-            std::wstring v = normalize_version((*it)[1].str());
-            std::string sha = lower((*it)[2].str());
-            if (v.empty()) continue;
-            Firmware& f = out[v];
-            f.version = v;
-            if (!f.sha256.empty() && f.sha256 != sha) post_log(L"Conflit SHA-256 sur " + v + L" (JSON perso) : référence connue conservée");
-            else { f.sha256 = sha; added++; }
-        }
-        post_log(F(L"sha256_references.json : %d empreinte(s) chargée(s)", added));
+        post_log(F(L"sha256_references.json : %d empreinte(s) chargée(s)", load_user_refs(js, out)));
     }
     return out;
 }
@@ -683,49 +916,181 @@ static uint64_t file_size(const std::wstring& p) {
     return ((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
 }
 
-static void make_dirs(const std::wstring& p) { SHCreateDirectoryExW(nullptr, p.c_str(), nullptr); }
+static bool make_dirs(const std::wstring& p) {
+    int r = SHCreateDirectoryExW(nullptr, p.c_str(), nullptr);
+    return r == ERROR_SUCCESS || r == ERROR_ALREADY_EXISTS || r == ERROR_FILE_EXISTS;
+}
+
+static void need_dirs(const std::wstring& p) {
+    if (!make_dirs(p)) fail(L"Création du dossier impossible : " + p);
+}
+
+static uint64_t file_mtime(const std::wstring& p) {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d)) return 0;
+    return ((uint64_t)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime;
+}
+
+static std::wstring io_error(DWORD e) {
+    switch (e) {
+    case ERROR_WRITE_PROTECT: return L"La clé est protégée en écriture (verrou physique ou clé en fin de vie).";
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL: return L"Plus d'espace libre sur le support.";
+    case ERROR_DEVICE_NOT_CONNECTED:
+    case ERROR_NO_SUCH_DEVICE:
+    case ERROR_DEV_NOT_EXIST:
+    case ERROR_NOT_READY:
+    case ERROR_FILE_INVALID:
+    case ERROR_DEVICE_REMOVED: return L"La clé a été retirée ou ne répond plus.";
+    case ERROR_CRC:
+    case ERROR_IO_DEVICE:
+    case ERROR_GEN_FAILURE:
+    case ERROR_SECTOR_NOT_FOUND: return L"Erreur matérielle de la clé (secteurs défectueux ?).";
+    }
+    return win_error(e);
+}
 
 static void check_header(const std::wstring& p) {
     Handle h(CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
-    if (!h.ok()) fail(L"Impossible d'ouvrir " + p + L" : " + win_error(GetLastError()));
+    if (!h.ok()) fail(L"Impossible d'ouvrir " + p + L" : " + io_error(GetLastError()));
     char head[4]{};
     DWORD got = 0;
-    ReadFile(h.h, head, 4, &got, nullptr);
+    if (!ReadFile(h.h, head, 4, &got, nullptr)) fail(L"Lecture impossible : " + io_error(GetLastError()));
     if (got != 4 || memcmp(head, "SLB2", 4) != 0) fail(L"En-tête SLB2 absent : ce n'est pas un PUP PS5 valide (ou fichier corrompu)");
 }
 
-static std::string hash_file(const std::wstring& path, bool unbuffered, const std::wstring& phase, std::string* md5out = nullptr) {
-    DWORD flags = FILE_FLAG_SEQUENTIAL_SCAN | (unbuffered ? FILE_FLAG_NO_BUFFERING : 0);
-    Handle h(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr));
-    if (!h.ok()) fail(L"Lecture impossible : " + path + L"\n" + win_error(GetLastError()));
-    uint64_t total = file_size(path), n = 0;
-    Hasher sha(BCRYPT_SHA256_ALGORITHM);
-    std::unique_ptr<Hasher> md5(md5out ? new Hasher(BCRYPT_MD5_ALGORITHM) : nullptr);
-    AlignedBuf buf(BLOCK);
-    Meter m(phase, total);
-    for (;;) {
-        check_cancel();
-        DWORD got = 0;
-        if (!ReadFile(h.h, buf.p, BLOCK, &got, nullptr)) fail(L"Erreur de lecture : " + win_error(GetLastError()));
-        if (!got) break;
-        sha.update(buf.p, got);
-        if (md5) md5->update(buf.p, got);
-        n += got;
-        m.tick(n);
+struct PupInfo {
+    bool structure_ok = false;
+    std::wstring summary;
+};
+
+static PupInfo inspect_pup(const std::wstring& p) {
+    PupInfo r;
+    Handle h(CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
+    if (!h.ok()) {
+        r.summary = L"illisible";
+        return r;
     }
-    m.tick(n, true);
-    if (n != total) fail(L"Lecture incomplète du fichier");
-    if (md5out) *md5out = md5->hex();
-    return sha.hex();
+    std::vector<BYTE> b(4096);
+    DWORD got = 0;
+    if (!ReadFile(h.h, b.data(), (DWORD)b.size(), &got, nullptr)) got = 0;
+    uint64_t size = file_size(p);
+    if (got < 0x20 || memcmp(b.data(), "SLB2", 4) != 0) {
+        r.summary = L"en-tête SLB2 absent";
+        return r;
+    }
+    auto u32 = [&](size_t o) {
+        uint32_t v;
+        memcpy(&v, b.data() + o, 4);
+        return v;
+    };
+    uint32_t ver = u32(4), count = u32(12);
+    if (count == 0 || count > 64 || 0x20 + (size_t)count * 48 > got) {
+        r.summary = F(L"SLB2 v%u, nombre d'entrées incohérent (%u)", ver, count);
+        return r;
+    }
+    std::wstring names;
+    bool ok = true;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t o = 0x20 + (size_t)i * 48;
+        uint64_t off = (uint64_t)u32(o) * 512, sz = u32(o + 4);
+        char nm[33]{};
+        memcpy(nm, b.data() + o + 16, 32);
+        bool printable = nm[0] != 0;
+        for (int k = 0; k < 32 && nm[k]; k++)
+            if ((unsigned char)nm[k] < 32 || (unsigned char)nm[k] > 126) printable = false;
+        if (!printable || sz == 0 || off + sz > size) ok = false;
+        if (i < 4) {
+            if (!names.empty()) names += L", ";
+            names += printable ? W(nm) : L"?";
+        }
+    }
+    if (count > 4) names += L", …";
+    r.structure_ok = ok;
+    r.summary = F(L"SLB2 v%u · %u entrée(s) · ", ver, count) + names + (ok ? L"" : L" · structure inhabituelle");
+    return r;
+}
+
+enum HashMode { HM_BUFFERED, HM_DIRECT };
+
+static bool direct_unsupported(DWORD e) {
+    return e == ERROR_INVALID_PARAMETER || e == ERROR_NOT_SUPPORTED || e == ERROR_INVALID_FUNCTION || e == ERROR_NOACCESS || e == ERROR_INVALID_USER_BUFFER;
+}
+
+static std::string hash_file(const std::wstring& path, HashMode mode, const std::wstring& phase, std::string* md5out = nullptr, bool* degraded = nullptr) {
+    uint64_t total = file_size(path);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        bool direct = mode == HM_DIRECT && attempt == 0;
+        if (mode == HM_DIRECT && attempt == 1) {
+            post_log(L"Relecture directe non prise en charge par ce matériel : relecture via le cache Windows");
+            if (degraded) *degraded = true;
+        }
+        DWORD flags = FILE_FLAG_SEQUENTIAL_SCAN | (direct ? FILE_FLAG_NO_BUFFERING : 0);
+        Handle h(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr));
+        if (!h.ok()) {
+            DWORD e = GetLastError();
+            if (direct && direct_unsupported(e)) continue;
+            fail(L"Lecture impossible : " + path + L"\n" + io_error(e));
+        }
+        Hasher sha(BCRYPT_SHA256_ALGORITHM);
+        std::unique_ptr<Hasher> md5(md5out ? new Hasher(BCRYPT_MD5_ALGORITHM) : nullptr);
+        AlignedBuf buf(BLOCK);
+        Meter m(phase, total);
+        uint64_t n = 0;
+        bool retry = false;
+        for (;;) {
+            check_cancel();
+            if (g_device_lost) fail(io_error(ERROR_DEVICE_NOT_CONNECTED));
+            DWORD got = 0;
+            if (!ReadFile(h.h, buf.p, BLOCK, &got, nullptr)) {
+                DWORD e = GetLastError();
+                if (direct && direct_unsupported(e)) {
+                    retry = true;
+                    break;
+                }
+                fail(L"Erreur de lecture : " + io_error(e));
+            }
+            if (!got) break;
+            sha.update(buf.p, got);
+            if (md5) md5->update(buf.p, got);
+            n += got;
+            m.tick(n);
+        }
+        if (retry) continue;
+        m.tick(n, true);
+        if (n != total) fail(L"Lecture incomplète du fichier");
+        if (md5out) *md5out = md5->hex();
+        return sha.hex();
+    }
+    fail(L"Relecture impossible sur ce support");
+}
+
+static bool write_all(HANDLE h, const void* p, DWORD n, uint64_t before, DWORD& err) {
+#ifdef PSD_TEST
+    if (g_test_fail_after && before + n > g_test_fail_after) {
+        err = g_test_fail_code;
+        return false;
+    }
+#endif
+    (void)before;
+    DWORD wr = 0;
+    if (!WriteFile(h, p, n, &wr, nullptr) || wr != n) {
+        err = GetLastError();
+        if (!err) err = ERROR_WRITE_FAULT;
+        return false;
+    }
+    return true;
 }
 
 struct Drive {
     wchar_t letter = 0;
-    std::wstring label, fs, model, id;
+    std::wstring label, fs, model, id, volguid;
     uint64_t size = 0, free = 0;
     DWORD disk = 0;
-    bool removable = false;
+    bool removable = false, writable = true, stale_tmp = false;
+    uint64_t pup_size = 0, pup_mtime = 0;
     std::wstring root() const { return std::wstring{letter, L':', L'\\'}; }
+    std::wstring pup_path() const { return root() + L"PS5\\UPDATE\\PS5UPDATE.PUP"; }
     bool fs_ok() const {
         std::wstring l = wlower(fs);
         return l == L"fat32" || l == L"exfat";
@@ -767,14 +1132,19 @@ static std::vector<Drive> list_usb() {
         bool hasnum = DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &sdn, sizeof sdn, &got, nullptr);
         GET_LENGTH_INFORMATION li{};
         bool haslen = DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0, &li, sizeof li, &got, nullptr);
+        bool writable = true;
+        if (!DeviceIoControl(h, IOCTL_DISK_IS_WRITABLE, nullptr, 0, nullptr, 0, &got, nullptr) && GetLastError() == ERROR_WRITE_PROTECT) writable = false;
         CloseHandle(h);
         if (!usb || !hasnum) continue;
         Drive d;
         d.letter = L;
         d.disk = sdn.DeviceNumber;
         d.removable = t == DRIVE_REMOVABLE;
+        d.writable = writable;
         d.model = trim(trim(WCP(vendor, CP_ACP)) + L" " + trim(WCP(product, CP_ACP)));
         d.id = trim(WCP(serial, CP_ACP)) + L"#" + std::to_wstring(d.disk) + L"#" + d.model;
+        wchar_t guid[64]{};
+        if (GetVolumeNameForVolumeMountPointW(root.c_str(), guid, 64)) d.volguid = guid;
         wchar_t label[MAX_PATH + 1]{}, fsn[64]{};
         if (GetVolumeInformationW(root.c_str(), label, MAX_PATH + 1, nullptr, nullptr, nullptr, fsn, 64)) {
             d.label = label;
@@ -785,15 +1155,29 @@ static std::vector<Drive> list_usb() {
             d.size = tot.QuadPart;
             d.free = fa.QuadPart;
         } else if (haslen) d.size = (uint64_t)li.Length.QuadPart;
+        if (d.fs_ok()) {
+            d.pup_size = file_exists(d.pup_path()) ? file_size(d.pup_path()) : 0;
+            d.pup_mtime = d.pup_size ? file_mtime(d.pup_path()) : 0;
+            d.stale_tmp = file_exists(d.pup_path() + L".tmp");
+        }
         out.push_back(d);
     }
     return out;
 }
 
-static Drive recheck_drive(const Drive& d) {
-    for (auto& x : list_usb())
-        if (x.letter == d.letter && x.id == d.id) return x;
-    fail(L"La clé USB a été débranchée ou remplacée depuis la sélection. Actualise la liste.");
+static Drive recheck_drive(const Drive& d, bool strict = true) {
+    auto all = list_usb();
+    for (auto& x : all) {
+        if (x.id != d.id) continue;
+        if (x.letter != d.letter) fail(F(L"La clé est passée de %lc: à %lc:. Actualise la liste avant de continuer.", d.letter, x.letter));
+        if (strict && !d.volguid.empty() && x.volguid != d.volguid) fail(L"Le volume de la clé a changé (repartitionnée ou remplacée). Actualise la liste.");
+        if (strict && d.size && x.size && (x.size > d.size + d.size / 100 || x.size + d.size / 100 < d.size))
+            fail(L"La capacité de la clé a changé depuis la sélection (" + human(d.size) + L" → " + human(x.size) + L"). Opération arrêtée.");
+        return x;
+    }
+    for (auto& x : all)
+        if (x.letter == d.letter) fail(F(L"Une autre clé occupe maintenant %lc:. Opération arrêtée par sécurité.", d.letter));
+    fail(L"La clé USB a été débranchée depuis la sélection.");
 }
 
 static std::wstring megacmd() {
@@ -809,6 +1193,40 @@ static std::wstring megacmd() {
     return {};
 }
 
+static std::wstring megaclient() {
+    std::wstring b = megacmd();
+    if (b.empty()) return {};
+    std::wstring p = b.substr(0, b.find_last_of(L"\\/")) + L"\\MEGAclient.exe";
+    return file_exists(p) ? p : std::wstring();
+}
+
+static std::wstring quote_arg(const std::wstring& a) {
+    if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
+    std::wstring r = L"\"";
+    size_t bs = 0;
+    for (wchar_t c : a) {
+        if (c == L'\\') {
+            bs++;
+            continue;
+        }
+        if (c == L'"') {
+            r.append(bs * 2 + 1, L'\\');
+            r += c;
+        } else {
+            r.append(bs, L'\\');
+            r += c;
+        }
+        bs = 0;
+    }
+    r.append(bs * 2, L'\\');
+    return r + L"\"";
+}
+
+static bool mega_url_ok(const std::wstring& u) {
+    static const std::wregex re(LR"(^https://mega\.nz/(file|folder)/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+$)");
+    return std::regex_match(u, re);
+}
+
 static void largest_file(const std::wstring& dir, std::wstring& best, uint64_t& best_size) {
     WIN32_FIND_DATAW fd;
     HANDLE f = FindFirstFileW((dir + L"\\*").c_str(), &fd);
@@ -820,7 +1238,10 @@ static void largest_file(const std::wstring& dir, std::wstring& best, uint64_t& 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) largest_file(full, best, best_size);
         else {
             uint64_t s = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-            if (s > best_size) { best_size = s; best = full; }
+            if (s > best_size) {
+                best_size = s;
+                best = full;
+            }
         }
     } while (FindNextFileW(f, &fd));
     FindClose(f);
@@ -835,27 +1256,52 @@ static void delete_tree(const std::wstring& dir) {
     SHFileOperationW(&op);
 }
 
-static void download_mega(const Firmware& fw, const std::wstring& dest) {
-    if (url_host(fw.mega) != L"mega.nz" || fw.mega.find(L'#') == std::wstring::npos) fail(L"Lien MEGA incomplet (clé de partage absente)");
-    std::wstring exe = megacmd();
-    if (exe.empty()) fail(L"MEGAcmd n'est pas installé (https://mega.nz/cmd)");
-    std::wstring dir = dest.substr(0, dest.rfind(L'\\')) + L"\\mega";
-    delete_tree(dir);
-    make_dirs(dir);
-    post_log(L"Téléchargement MEGA via MEGAcmd…");
-    std::wstring cmd = L"cmd.exe /d /c \"\"" + exe + L"\" \"" + fw.mega + L"\" \"" + dir + L"\"\"";
+static DWORD run_hidden(const std::wstring& exe, const std::wstring& args, HANDLE job, DWORD timeout, HANDLE* proc_out = nullptr) {
+    std::wstring cmd = quote_arg(exe) + L" " + args;
     STARTUPINFOW si{};
     si.cb = sizeof si;
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-        fail(L"Lancement de MEGAcmd impossible : " + win_error(GetLastError()));
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) return (DWORD)-1;
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
-    Handle proc(pi.hProcess);
+    if (proc_out) {
+        *proc_out = pi.hProcess;
+        return 0;
+    }
+    DWORD code = (DWORD)-2;
+    if (WaitForSingleObject(pi.hProcess, timeout) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    else TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+    return code;
+}
+
+static void download_mega(const Firmware& fw, const std::wstring& dest) {
+    if (!mega_url_ok(fw.mega)) fail(L"Lien MEGA invalide ou incomplet (clé de partage absente)");
+    std::wstring exe = megaclient();
+    if (exe.empty()) fail(L"MEGAcmd (MEGAclient.exe) introuvable : installe-le depuis https://mega.nz/cmd");
+    std::wstring dir = dest.substr(0, dest.rfind(L'\\')) + L"\\mega";
+    delete_tree(dir);
+    need_dirs(dir);
+    post_log(L"Téléchargement MEGA via MEGAcmd…");
+    Handle job(CreateJobObjectW(nullptr, nullptr));
+    if (job.ok()) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &li, sizeof li);
+    }
+    HANDLE ph = nullptr;
+    if (run_hidden(exe, L"get " + quote_arg(fw.mega) + L" " + quote_arg(dir), job.ok() ? job.h : nullptr, 0, &ph) != 0 || !ph)
+        fail(L"Lancement de MEGAcmd impossible : " + win_error(GetLastError()));
+    Handle proc(ph);
     Meter m(L"Téléchargement MEGA", fw.size);
     while (WaitForSingleObject(proc.h, 400) == WAIT_TIMEOUT) {
         if (g_cancel) {
-            TerminateProcess(proc.h, 1);
-            throw Cancelled{L"Arrêt demandé. MEGAcmd peut poursuivre le transfert en arrière-plan."};
+            if (job.ok()) TerminateJobObject(job.h, 1);
+            else TerminateProcess(proc.h, 1);
+            DWORD c = run_hidden(exe, L"transfers -c -a", nullptr, 15000);
+            post_log(c == 0 ? L"Transferts MEGA annulés côté serveur MEGAcmd" : L"Impossible de confirmer l'arrêt du transfert MEGA : vérifie avec « mega-transfers »");
+            throw Cancelled{L"Téléchargement MEGA annulé."};
         }
         std::wstring best;
         uint64_t bs = 0;
@@ -878,41 +1324,69 @@ static std::vector<std::wstring> read_lines(const std::wstring& p) {
     std::vector<std::wstring> out;
     Handle h(CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
     if (!h.ok()) return out;
-    std::string s(16384, 0);
+    std::string s(65536, 0);
     DWORD got = 0;
-    ReadFile(h.h, s.data(), (DWORD)s.size(), &got, nullptr);
+    if (!ReadFile(h.h, s.data(), (DWORD)s.size(), &got, nullptr)) return out;
     s.resize(got);
     std::wstring w = W(s);
     size_t a = 0;
-    while (a <= w.size()) {
+    while (a < w.size()) {
         size_t b = w.find(L'\n', a);
         if (b == std::wstring::npos) b = w.size();
-        out.push_back(w.substr(a, b - a));
+        std::wstring line = w.substr(a, b - a);
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        out.push_back(line);
         a = b + 1;
     }
     return out;
 }
 
-static void write_lines(const std::wstring& p, const std::vector<std::wstring>& lines) {
+static bool write_lines(const std::wstring& p, const std::vector<std::wstring>& lines) {
     std::wstring w;
     for (auto& l : lines) w += l + L"\n";
     std::string s = U(w);
     std::wstring tmp = p + L".new";
     {
         Handle h(CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr));
-        if (!h.ok()) return;
+        if (!h.ok()) return false;
         DWORD wr = 0;
-        WriteFile(h.h, s.data(), (DWORD)s.size(), &wr, nullptr);
+        if (!WriteFile(h.h, s.data(), (DWORD)s.size(), &wr, nullptr) || wr != s.size() || !FlushFileBuffers(h.h)) {
+            h.close();
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
     }
-    MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING);
+    if (!MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static std::wstring sidecar(const std::wstring& f) { return f + L".verified"; }
+
+static void write_sidecar(const std::wstring& f, const std::string& sha) {
+    if (!write_lines(sidecar(f), {W(sha), std::to_wstring(file_size(f)), std::to_wstring(file_mtime(f))})) post_log(L"Impossible d'enregistrer la vérification du cache (non bloquant)");
+}
+
+static bool sidecar_ok(const std::wstring& f, const std::string& sha) {
+    if (!file_exists(f)) return false;
+    auto l = read_lines(sidecar(f));
+    return l.size() >= 3 && l[0] == W(sha) && l[1] == std::to_wstring(file_size(f)) && l[2] == std::to_wstring(file_mtime(f));
 }
 
 static void sleep_cancellable(int seconds) {
+#ifdef PSD_TEST
+    if (g_test_fast) seconds = 0;
+#endif
     for (int i = 0; i < seconds * 10; i++) {
         check_cancel();
         Sleep(100);
     }
+    check_cancel();
 }
+
+static bool strong_etag(const std::wstring& e) { return !e.empty() && e.rfind(L"W/", 0) != 0; }
 
 static void download_http(const Firmware& fw, const std::wstring& dest) {
     if (!allowed_download(fw.direct)) fail(L"Adresse de téléchargement non autorisée");
@@ -923,7 +1397,7 @@ static void download_http(const Firmware& fw, const std::wstring& dest) {
         try {
             uint64_t existing = file_exists(part) ? file_size(part) : 0;
             if (fw.size && existing > fw.size) {
-                DeleteFileW(part.c_str());
+                if (!DeleteFileW(part.c_str())) fail(L"Suppression du fichier partiel impossible : " + win_error(GetLastError()));
                 existing = 0;
             }
             if (fw.size && existing == fw.size) {
@@ -934,26 +1408,30 @@ static void download_http(const Firmware& fw, const std::wstring& dest) {
             auto info = read_lines(meta);
             if (existing && (info.size() < 2 || info[0] != fw.direct || info[1] != W(fw.sha256))) {
                 post_log(L"Reprise invalide (source différente) : téléchargement repris à zéro");
-                DeleteFileW(part.c_str());
+                if (!DeleteFileW(part.c_str())) fail(L"Suppression du fichier partiel impossible : " + win_error(GetLastError()));
                 existing = 0;
             }
+            std::wstring old_etag = info.size() > 2 ? info[2] : L"", old_lm = info.size() > 3 ? info[3] : L"";
             std::wstring hdr = L"Accept: application/octet-stream\r\nReferer: " + std::wstring(M_ARCHIVE) + L"\r\n";
             if (existing) {
                 hdr += F(L"Range: bytes=%llu-\r\n", (unsigned long long)existing);
-                if (info.size() > 2 && !info[2].empty()) hdr += L"If-Range: " + info[2] + L"\r\n";
-                else if (info.size() > 3 && !info[3].empty()) hdr += L"If-Range: " + info[3] + L"\r\n";
+                if (strong_etag(old_etag)) hdr += L"If-Range: " + old_etag + L"\r\n";
+                else if (!old_lm.empty()) hdr += L"If-Range: " + old_lm + L"\r\n";
             }
             Req q;
-            http_open(q, fw.direct, hdr);
+            http_open(q, fw.direct, hdr, download_hosts());
             DWORD code = q.status;
             if (code == 400 || code == 401 || code == 403 || code == 404 || code == 410 || code == 451)
-                fail(F(L"Archive inaccessible (HTTP %lu). Télécharge le PUP via MEGA dans le navigateur puis glisse-le dans la fenêtre.", code));
+                fail(F(L"Archive inaccessible (HTTP %lu). Télécharge le PUP via MEGA dans le navigateur puis sélectionne-le.", code));
             if (code == 416) {
                 DeleteFileW(part.c_str());
+                DeleteFileW(meta.c_str());
                 fail(L"Plage HTTP refusée : reprise à zéro", false);
             }
+            if (code >= 500) fail(F(L"Serveur indisponible (HTTP %lu)", code), false);
             if (wlower(q.header(WINHTTP_QUERY_CONTENT_TYPE)).find(L"text/html") != std::wstring::npos)
-                fail(L"Le serveur renvoie une page HTML au lieu du firmware (protection anti-robot ?). Télécharge-le dans le navigateur puis glisse-le dans la fenêtre.");
+                fail(L"Le serveur renvoie une page HTML au lieu du firmware (protection anti-robot ?). Télécharge-le dans le navigateur puis sélectionne-le.");
+            std::wstring etag = q.header(WINHTTP_QUERY_ETAG), lm = q.header(WINHTTP_QUERY_LAST_MODIFIED);
             bool append = false;
             uint64_t offset = 0;
             if (existing && code == 206) {
@@ -962,12 +1440,18 @@ static void download_http(const Firmware& fw, const std::wstring& dest) {
                 int k = sscanf(cr.c_str(), "bytes %llu-%llu/%llu", &a, &b, &t);
                 if (k < 2 || a != existing) fail(L"Réponse HTTP Range incohérente", false);
                 if (k == 3 && fw.size && t != fw.size) fail(L"Taille distante différente du firmware attendu");
+                if (strong_etag(old_etag) && strong_etag(etag) && etag != old_etag) {
+                    post_log(L"ETag différent malgré la reprise : fichier distant modifié, reprise à zéro");
+                    DeleteFileW(part.c_str());
+                    fail(L"Fichier distant modifié", false);
+                }
                 append = true;
                 offset = existing;
             } else if (code != 200) {
                 fail(F(L"Réponse HTTP inattendue : %lu", code), false);
             } else if (existing) {
-                post_log(L"Le serveur ne gère pas la reprise : téléchargement repris à zéro");
+                if (strong_etag(old_etag) && etag != old_etag) post_log(L"Le fichier distant a changé (ETag différent) : téléchargement repris à zéro");
+                else post_log(L"Le serveur ne gère pas la reprise : téléchargement repris à zéro");
             }
             uint64_t length = _wcstoui64(q.header(WINHTTP_QUERY_CONTENT_LENGTH).c_str(), nullptr, 10);
             uint64_t total = fw.size ? fw.size : (length ? offset + length : 0);
@@ -977,12 +1461,12 @@ static void download_http(const Firmware& fw, const std::wstring& dest) {
                 if (GetDiskFreeSpaceExW(g_cache.c_str(), &fa, nullptr, nullptr) && fa.QuadPart < total - offset + HEADROOM)
                     fail(L"Espace disque insuffisant sur le PC : il faut " + human(total - offset + HEADROOM));
             }
-            write_lines(meta, {fw.direct, W(fw.sha256), q.header(WINHTTP_QUERY_ETAG), q.header(WINHTTP_QUERY_LAST_MODIFIED)});
+            if (!write_lines(meta, {fw.direct, W(fw.sha256), etag, lm})) fail(L"Écriture des informations de reprise impossible : " + win_error(GetLastError()));
             Handle out(CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, append ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
-            if (!out.ok()) fail(L"Écriture du cache impossible : " + win_error(GetLastError()));
+            if (!out.ok()) fail(L"Écriture du cache impossible : " + io_error(GetLastError()));
             if (append) {
-                LARGE_INTEGER z{};
-                SetFilePointerEx(out.h, z, nullptr, FILE_END);
+                LARGE_INTEGER z{}, pos{};
+                if (!SetFilePointerEx(out.h, z, &pos, FILE_END) || (uint64_t)pos.QuadPart != offset) fail(L"Positionnement dans le fichier partiel impossible", false);
             }
             uint64_t n = offset;
             Meter m(L"Téléchargement", total, offset);
@@ -990,10 +1474,14 @@ static void download_http(const Firmware& fw, const std::wstring& dest) {
             for (;;) {
                 check_cancel();
                 DWORD got = 0;
-                if (!WinHttpReadData(q.r, buf.data(), (DWORD)buf.size(), &got)) fail(L"Coupure réseau : " + win_error(GetLastError()), false);
+                if (!http_read(q, buf.data(), (DWORD)buf.size(), got)) {
+                    DWORD e = GetLastError();
+                    check_cancel();
+                    fail(L"Coupure réseau : " + win_error(e), false);
+                }
                 if (!got) break;
-                DWORD wr = 0;
-                if (!WriteFile(out.h, buf.data(), got, &wr, nullptr) || wr != got) fail(L"Écriture du cache impossible : " + win_error(GetLastError()));
+                DWORD err = 0;
+                if (!write_all(out.h, buf.data(), got, n, err)) fail(L"Écriture du cache impossible : " + io_error(err));
                 n += got;
                 if (total && n > total) {
                     out.close();
@@ -1003,7 +1491,7 @@ static void download_http(const Firmware& fw, const std::wstring& dest) {
                 m.tick(n);
             }
             m.tick(n, true);
-            FlushFileBuffers(out.h);
+            if (!FlushFileBuffers(out.h)) fail(L"Écriture du cache impossible : " + io_error(GetLastError()));
             out.close();
             if (total && n != total) fail(F(L"Téléchargement incomplet : %ls / %ls", human(n).c_str(), human(total).c_str()), false);
             if (!MoveFileExW(part.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING)) fail(L"Renommage impossible : " + win_error(GetLastError()));
@@ -1019,17 +1507,52 @@ static void download_http(const Firmware& fw, const std::wstring& dest) {
     fail(L"Échec après 8 tentatives : " + last.msg);
 }
 
+static void verify_download(const Firmware& fw, const std::wstring& dest, const wchar_t* phase) {
+    check_header(dest);
+    std::string md5;
+    std::string sha = hash_file(dest, HM_BUFFERED, phase, &md5);
+    if (sha != fw.sha256) {
+        DeleteFileW(dest.c_str());
+        DeleteFileW(sidecar(dest).c_str());
+        fail(L"SHA-256 différent de la référence : fichier supprimé.\nAttendu : " + W(fw.sha256) + L"\nObtenu  : " + W(sha));
+    }
+    if (!fw.md5.empty() && md5 != fw.md5) {
+        DeleteFileW(dest.c_str());
+        DeleteFileW(sidecar(dest).c_str());
+        fail(L"SHA-256 correct mais MD5 différent : références incohérentes, fichier supprimé");
+    }
+    PupInfo pi = inspect_pup(dest);
+    post_log(L"Structure du PUP : " + pi.summary);
+    write_sidecar(dest, sha);
+}
+
 static std::wstring acquire(const Firmware& fw, bool& from_cache) {
     std::wstring dir = g_cache + L"\\" + fw.version;
-    make_dirs(dir);
+    need_dirs(dir);
     std::wstring dest = dir + L"\\PS5UPDATE.PUP";
-    if (file_exists(dest) && (!fw.size || file_size(dest) == fw.size)) {
-        post_log(L"PUP déjà présent dans le cache : il sera contrôlé pendant la copie");
-        from_cache = true;
-        return dest;
-    }
     from_cache = false;
-    bool mega_ok = !fw.mega.empty() && !megacmd().empty();
+    if (file_exists(dest)) {
+        if (sidecar_ok(dest, fw.sha256)) {
+            post_log(L"PUP déjà vérifié dans le cache");
+            from_cache = true;
+            return dest;
+        }
+        if (!fw.size || file_size(dest) == fw.size) {
+            set_step(1);
+            post_log(L"PUP en cache non vérifié : contrôle avant utilisation");
+            try {
+                verify_download(fw, dest, L"Vérification du cache");
+                from_cache = true;
+                return dest;
+            } catch (AppError& e) {
+                post_log(L"Cache rejeté : " + e.msg);
+            }
+        }
+        DeleteFileW(dest.c_str());
+        DeleteFileW(sidecar(dest).c_str());
+    }
+    set_step(0);
+    bool mega_ok = !fw.mega.empty() && !megaclient().empty();
     if (!fw.direct.empty()) {
         try {
             download_http(fw, dest);
@@ -1041,99 +1564,226 @@ static std::wstring acquire(const Firmware& fw, bool& from_cache) {
     } else if (mega_ok) {
         download_mega(fw, dest);
     } else {
-        fail(L"Aucune source automatique pour cette version. Télécharge le PUP puis glisse-le dans la fenêtre.");
+        fail(L"Aucune source automatique pour cette version. Télécharge le PUP puis sélectionne-le.");
     }
-    check_header(dest);
-    std::string md5;
-    std::string sha = hash_file(dest, false, L"Vérification du téléchargement", &md5);
-    if (sha != fw.sha256) {
-        DeleteFileW(dest.c_str());
-        fail(L"SHA-256 du téléchargement différent de la référence : fichier supprimé.\nAttendu : " + W(fw.sha256) + L"\nObtenu  : " + W(sha));
-    }
-    if (!fw.md5.empty() && md5 != fw.md5) {
-        DeleteFileW(dest.c_str());
-        fail(L"SHA-256 correct mais MD5 différent : références incohérentes, fichier supprimé");
-    }
+    set_step(1);
+    verify_download(fw, dest, L"Vérification du téléchargement");
     post_log(L"Téléchargement vérifié (SHA-256 conforme)");
     return dest;
 }
 
-static void copy_and_verify(const std::wstring& src, const Drive& sel, const Firmware& fw, bool src_is_cache, bool delete_old) {
-    Drive d = recheck_drive(sel);
-    if (!d.fs_ok()) fail(L"La clé est en " + d.fs + L" : FAT32 ou exFAT requis. Utilise « Formater exFAT ».");
-    uint64_t n = file_size(src);
-    if (n < MIN_BYTES) fail(L"PUP trop petit : " + human(n));
-    if (fw.size && n != fw.size) fail(F(L"Taille inattendue : %llu octets au lieu de %llu", (unsigned long long)n, (unsigned long long)fw.size));
-    if (d.fs_ok() && wlower(d.fs) == L"fat32" && n >= 0xFFFFFFFFull) fail(L"Fichier > 4 Gio : exFAT obligatoire");
-    check_header(src);
-    std::wstring dir = d.root() + L"PS5\\UPDATE";
-    std::wstring fin = dir + L"\\PS5UPDATE.PUP", staging = dir + L"\\PS5UPDATE.PUP.tmp";
-    uint64_t old = file_exists(fin) ? file_size(fin) : 0;
-    if (delete_old && old) {
-        if (!DeleteFileW(fin.c_str())) fail(L"Suppression de l'ancien PUP impossible : " + win_error(GetLastError()));
-        post_log(L"Ancien PS5UPDATE.PUP supprimé pour libérer de la place");
-        d = recheck_drive(sel);
+static void copy_with_meter(const std::wstring& src, const std::wstring& dst, const std::wstring& phase, bool cancellable) {
+    Handle in(CreateFileW(src.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (!in.ok()) fail(L"Lecture impossible : " + io_error(GetLastError()));
+    Handle out(CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (!out.ok()) fail(L"Écriture impossible : " + io_error(GetLastError()));
+    uint64_t total = file_size(src), n = 0;
+    AlignedBuf buf(BLOCK);
+    Meter m(phase, total);
+    bool ok = false;
+    struct G {
+        Handle& o;
+        const std::wstring& d;
+        bool& ok;
+        ~G() {
+            if (!ok) {
+                o.close();
+                DeleteFileW(d.c_str());
+            }
+        }
+    } g{out, dst, ok};
+    for (;;) {
+        if (cancellable) check_cancel();
+        DWORD got = 0;
+        if (!ReadFile(in.h, buf.p, BLOCK, &got, nullptr)) fail(L"Lecture : " + io_error(GetLastError()));
+        if (!got) break;
+        DWORD wr = 0;
+        if (!WriteFile(out.h, buf.p, got, &wr, nullptr) || wr != got) fail(L"Écriture : " + io_error(GetLastError()));
+        n += got;
+        m.tick(n);
     }
-    DeleteFileW(staging.c_str());
-    if (d.free < n + HEADROOM) fail(L"Espace libre insuffisant sur la clé : " + human(d.free) + L" disponibles, il faut " + human(n + HEADROOM));
-    CreateDirectoryW((d.root() + L"PS5").c_str(), nullptr);
-    CreateDirectoryW(dir.c_str(), nullptr);
-    post_log(L"Copie vers " + fin);
+    if (!FlushFileBuffers(out.h)) fail(L"Écriture : " + io_error(GetLastError()));
+    if (n != total) fail(L"Copie incomplète");
+    ok = true;
+}
+
+struct CopyOpts {
+    bool src_is_cache = false;
+    std::wstring backup;
+    std::function<void()> recheck;
+};
+
+static void copy_verify_core(const std::wstring& src, const std::wstring& dir, const Firmware& fw, const CopyOpts& o) {
+    std::wstring fin = dir + L"\\PS5UPDATE.PUP", staging = fin + L".tmp";
+    if (file_exists(staging) && !DeleteFileW(staging.c_str())) fail(L"Fichier temporaire précédent impossible à supprimer : " + io_error(GetLastError()));
+    uint64_t n = file_size(src);
     struct Guard {
-        std::wstring p;
+        std::wstring staging, fin, backup;
         bool armed = true;
-        ~Guard() { if (armed) DeleteFileW(p.c_str()); }
-    } guard{staging};
+        ~Guard() {
+            if (!armed) return;
+            if (file_exists(staging) && !DeleteFileW(staging.c_str())) post_log(L"Fichier temporaire impossible à supprimer sur la clé : " + staging);
+            else post_log(L"Fichier temporaire supprimé de la clé");
+            if (!backup.empty() && file_exists(backup) && !file_exists(fin)) {
+                try {
+                    copy_with_meter(backup, fin, L"Restauration de l'ancien PUP", false);
+                    post_log(L"Ancien PUP restauré sur la clé");
+                    DeleteFileW(backup.c_str());
+                } catch (AppError& e) {
+                    post_log(L"Restauration impossible (" + e.msg + L"). Copie de sauvegarde conservée : " + backup);
+                }
+            }
+        }
+    } guard{staging, fin, o.backup};
+    set_step(2);
     std::string src_sha;
     {
         Handle in(CreateFileW(src.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
-        if (!in.ok()) fail(L"Lecture du PUP impossible : " + win_error(GetLastError()));
+        if (!in.ok()) fail(L"Lecture du PUP impossible : " + io_error(GetLastError()));
         Handle out(CreateFileW(staging.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
-        if (!out.ok()) fail(L"Écriture sur la clé impossible : " + win_error(GetLastError()));
+        if (!out.ok()) fail(L"Écriture sur la clé impossible : " + io_error(GetLastError()));
         Hasher sha(BCRYPT_SHA256_ALGORITHM);
         AlignedBuf buf(BLOCK);
         Meter m(L"Copie sur la clé", n);
         uint64_t copied = 0;
         for (;;) {
             check_cancel();
+#ifdef PSD_TEST
+            if (g_test_cancel_after && copied >= g_test_cancel_after) g_cancel = true, check_cancel();
+#endif
+            if (g_device_lost) fail(io_error(ERROR_DEVICE_NOT_CONNECTED));
             DWORD got = 0;
-            if (!ReadFile(in.h, buf.p, BLOCK, &got, nullptr)) fail(L"Lecture : " + win_error(GetLastError()));
+            if (!ReadFile(in.h, buf.p, BLOCK, &got, nullptr)) fail(L"Lecture : " + io_error(GetLastError()));
             if (!got) break;
             sha.update(buf.p, got);
-            DWORD wr = 0;
-            if (!WriteFile(out.h, buf.p, got, &wr, nullptr) || wr != got) fail(L"Écriture sur la clé : " + win_error(GetLastError()));
+            DWORD err = 0;
+            if (!write_all(out.h, buf.p, got, copied, err)) fail(L"Écriture sur la clé : " + io_error(err));
             copied += got;
             m.tick(copied);
         }
         m.tick(copied, true);
         post_prog(L"Vidage du cache d'écriture…", 0, 0, L"Ne débranche pas la clé");
-        if (!FlushFileBuffers(out.h)) fail(L"Vidage du cache impossible : " + win_error(GetLastError()));
+        if (!FlushFileBuffers(out.h)) fail(L"Vidage du cache impossible : " + io_error(GetLastError()));
         src_sha = sha.hex();
         if (copied != n) fail(L"Copie incomplète");
     }
     if (src_sha != fw.sha256) {
-        if (src_is_cache) DeleteFileW(src.c_str());
-        fail(std::wstring(L"SHA-256 du PUP source différent de la référence") + (src_is_cache ? L" : copie en cache corrompue supprimée, relance la préparation." : L".") +
+        if (o.src_is_cache) {
+            DeleteFileW(src.c_str());
+            DeleteFileW(sidecar(src).c_str());
+        }
+        fail(std::wstring(L"SHA-256 du PUP source différent de la référence") + (o.src_is_cache ? L" : copie en cache corrompue supprimée, relance la préparation." : L".") +
              L"\nAttendu : " + W(fw.sha256) + L"\nObtenu  : " + W(src_sha));
     }
-    post_log(L"Source conforme. Relecture directe depuis la clé (sans cache Windows)…");
-    std::string back = hash_file(staging, true, L"Relecture de la clé USB");
+    set_step(3);
+    post_log(L"Source conforme. Relecture directe depuis la clé…");
+    bool degraded = false;
+    std::string back = hash_file(staging, HM_DIRECT, L"Relecture de la clé USB", nullptr, &degraded);
     if (back != fw.sha256) fail(L"La relecture de la clé ne correspond pas : clé défectueuse ou contrefaite ? Essaie une autre clé.");
-    if (!MoveFileExW(staging.c_str(), fin.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-        fail(L"Renommage final impossible : " + win_error(GetLastError()));
+    if (o.recheck) o.recheck();
+    if (!MoveFileExW(staging.c_str(), fin.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) fail(L"Renommage final impossible : " + io_error(GetLastError()));
     guard.armed = false;
-    post_log(L"Copie relue et vérifiée : PS5\\UPDATE\\PS5UPDATE.PUP");
+    if (!o.backup.empty()) DeleteFileW(o.backup.c_str());
+    post_log(degraded ? L"Copie relue et vérifiée (relecture via cache Windows)" : L"Copie relue et vérifiée directement sur la clé");
+}
+
+static std::wstring usb_record_path() { return g_cache + L"\\usb_verified.txt"; }
+
+static void record_usb_verified(const Drive& d, const std::wstring& version) {
+    if (!d.pup_size) return;
+    auto lines = read_lines(usb_record_path());
+    std::wstring key = d.id + L"\t";
+    lines.erase(std::remove_if(lines.begin(), lines.end(), [&](const std::wstring& l) { return l.rfind(key, 0) == 0; }), lines.end());
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    lines.push_back(d.id + L"\t" + std::to_wstring(d.pup_size) + L"\t" + std::to_wstring(d.pup_mtime) + L"\t" + version + F(L"\t%02d.%02d %02d:%02d", t.wDay, t.wMonth, t.wHour, t.wMinute));
+    if (lines.size() > 50) lines.erase(lines.begin(), lines.begin() + (lines.size() - 50));
+    make_dirs(g_cache);
+    write_lines(usb_record_path(), lines);
+}
+
+struct UsbState {
+    int state = 0;
+    std::wstring version, when;
+};
+
+static UsbState usb_state(const Drive& d) {
+    UsbState s;
+    if (!d.pup_size) return s;
+    s.state = 1;
+    for (auto& l : read_lines(usb_record_path())) {
+        std::vector<std::wstring> f;
+        size_t a = 0;
+        while (true) {
+            size_t b = l.find(L'\t', a);
+            f.push_back(l.substr(a, b == std::wstring::npos ? std::wstring::npos : b - a));
+            if (b == std::wstring::npos) break;
+            a = b + 1;
+        }
+        if (f.size() >= 5 && f[0] == d.id && f[1] == std::to_wstring(d.pup_size) && f[2] == std::to_wstring(d.pup_mtime)) {
+            s.state = 2;
+            s.version = f[3];
+            s.when = f[4];
+        }
+    }
+    return s;
+}
+
+static std::string copy_and_verify(const std::wstring& src, const Drive& sel, const Firmware& fw, bool src_is_cache, bool delete_old) {
+    Drive d = recheck_drive(sel);
+    if (!d.fs_ok()) fail(L"La clé est en " + d.fs + L" : FAT32 ou exFAT requis. Utilise « Formater ».");
+    if (!d.writable) fail(io_error(ERROR_WRITE_PROTECT));
+    uint64_t n = file_size(src);
+    if (n < MIN_BYTES) fail(L"PUP trop petit : " + human(n));
+    if (fw.size && n != fw.size) fail(F(L"Taille inattendue : %llu octets au lieu de %llu", (unsigned long long)n, (unsigned long long)fw.size));
+    if (wlower(d.fs) == L"fat32" && n >= 0xFFFFFFFFull) fail(L"Fichier > 4 Gio : exFAT obligatoire");
+    check_header(src);
+    std::wstring dir = d.root() + L"PS5\\UPDATE";
+    std::wstring fin = dir + L"\\PS5UPDATE.PUP";
+    for (const std::wstring& p : {d.root() + L"PS5", dir})
+        if (!CreateDirectoryW(p.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) fail(L"Création de " + p + L" impossible : " + io_error(GetLastError()));
+    CopyOpts o;
+    o.src_is_cache = src_is_cache;
+    o.recheck = [sel] { recheck_drive(sel); };
+    uint64_t old = file_exists(fin) ? file_size(fin) : 0;
+    uint64_t stale = file_exists(fin + L".tmp") ? file_size(fin + L".tmp") : 0;
+    if (delete_old && old) {
+        std::wstring bdir = g_cache + L"\\backup";
+        need_dirs(bdir);
+        ULARGE_INTEGER fa{};
+        if (GetDiskFreeSpaceExW(g_cache.c_str(), &fa, nullptr, nullptr) && fa.QuadPart < old + HEADROOM)
+            fail(L"Pas assez de place sur le PC pour sauvegarder l'ancien PUP avant de le remplacer (" + human(old) + L").");
+        o.backup = bdir + L"\\PS5UPDATE.PUP";
+        copy_with_meter(fin, o.backup, L"Sauvegarde de l'ancien PUP", true);
+        if (!DeleteFileW(fin.c_str())) {
+            DeleteFileW(o.backup.c_str());
+            fail(L"Suppression de l'ancien PUP impossible : " + io_error(GetLastError()));
+        }
+        post_log(L"Ancien PUP sauvegardé sur le PC puis retiré de la clé (restauré automatiquement en cas d'échec)");
+        d = recheck_drive(sel);
+    }
+    if (d.free + stale < n + HEADROOM) fail(L"Espace libre insuffisant sur la clé : " + human(d.free) + L" disponibles, il faut " + human(n + HEADROOM));
+    post_log(L"Copie vers " + fin);
+    copy_verify_core(src, dir, fw, o);
+    try {
+        record_usb_verified(recheck_drive(sel), fw.version);
+    } catch (AppError&) {
+    }
+    return fw.sha256;
 }
 
 static void format_drive(const Drive& sel) {
     Drive d = recheck_drive(sel);
+    if (d.volguid.empty()) fail(L"Identifiant de volume introuvable : formatage refusé par sécurité.");
     wchar_t tmp[MAX_PATH]{}, sysdir[MAX_PATH]{};
     GetTempPathW(MAX_PATH, tmp);
     GetSystemDirectoryW(sysdir, MAX_PATH);
-    std::wstring log = std::wstring(tmp) + L"ps5usbprep_format.log";
+    std::wstring log = std::wstring(tmp) + F(L"psd_format_%lu.log", GetCurrentProcessId());
     DeleteFileW(log.c_str());
     std::wstring cmd = std::wstring(sysdir) + L"\\cmd.exe";
-    std::wstring params = F(L"/d /c \"echo.| \"%ls\\format.com\" %lc: /FS:exFAT /Q /V:PS5 /X /Y > \"%ls\" 2>&1\"", sysdir, d.letter, log.c_str());
+    std::wstring letter = std::wstring(1, d.letter) + L":";
+    std::wstring params = L"/d /s /c \"for /f \"tokens=*\" %v in ('\"" + std::wstring(sysdir) + L"\\mountvol.exe\" " + letter + L" /L') do @if /i \"%v\"==\"" + d.volguid +
+                          L"\" (echo.| \"" + sysdir + L"\\format.com\" " + letter + L" /FS:exFAT /Q /V:PS5 /X /Y > \"" + log + L"\" 2>&1) else exit 91\"";
     SHELLEXECUTEINFOW sei{};
     sei.cbSize = sizeof sei;
     sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
@@ -1143,36 +1793,50 @@ static void format_drive(const Drive& sel) {
     sei.lpParameters = params.c_str();
     sei.nShow = SW_HIDE;
     post_prog(L"Formatage exFAT…", 0, 0, L"Accepte la demande d'administrateur Windows");
+    d = recheck_drive(sel);
     if (!ShellExecuteExW(&sei)) {
         DWORD e = GetLastError();
         if (e == ERROR_CANCELLED) fail(L"Droits administrateur refusés : formatage annulé");
         fail(L"Lancement du formatage impossible : " + win_error(e));
     }
     if (!sei.hProcess) fail(L"Processus de formatage introuvable");
+    g_nocancel = true;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_NOCANCEL, 1, 0);
+    struct NC {
+        ~NC() {
+            g_nocancel = false;
+            if (g_hwnd) PostMessageW(g_hwnd, WM_NOCANCEL, 0, 0);
+        }
+    } nc;
     Handle proc(sei.hProcess);
-    post_prog(L"Formatage exFAT…", 0, 0, L"Ne débranche pas la clé");
-    post_log(F(L"Formatage de %lc: en exFAT (nom PS5)…", d.letter));
+    post_prog(L"Formatage exFAT…", 0, 0, L"Ne débranche pas la clé · étape non annulable");
+    post_log(F(L"Formatage de %lc: (%ls) en exFAT, nom PS5…", d.letter, d.volguid.c_str()));
     WaitForSingleObject(proc.h, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(proc.h, &code);
-    Handle lh(CreateFileW(log.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr));
     std::wstring text;
-    if (lh.ok()) {
-        std::string s(65536, 0);
-        DWORD got = 0;
-        ReadFile(lh.h, s.data(), (DWORD)s.size(), &got, nullptr);
-        s.resize(got);
-        text = trim(WCP(s, CP_OEMCP));
+    bool ran = file_exists(log);
+    if (ran) {
+        Handle lh(CreateFileW(log.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr));
+        if (lh.ok()) {
+            std::string s(65536, 0);
+            DWORD got = 0;
+            if (ReadFile(lh.h, s.data(), (DWORD)s.size(), &got, nullptr)) s.resize(got);
+            else s.clear();
+            text = trim(WCP(s, CP_OEMCP));
+        }
+        DeleteFileW(log.c_str());
     }
-    lh.close();
-    DeleteFileW(log.c_str());
+    if (code == 91) fail(L"La lettre ne désignait plus la même clé au moment du formatage : rien n'a été effacé.");
+    if (!ran) fail(L"Le volume de la clé n'a pas été retrouvé au moment du formatage : rien n'a été effacé.");
     if (code != 0) {
         if (text.size() > 600) text = text.substr(text.size() - 600);
         fail(F(L"format.com a échoué (code %lu).\n", code) + text);
     }
-    Sleep(1000);
-    Drive after = recheck_drive(sel);
-    post_log(L"Formatage terminé : " + after.fs + L", " + human(after.size));
+    Sleep(1500);
+    Drive after = recheck_drive(sel, false);
+    if (wlower(after.fs) != L"exfat") fail(L"Le formatage s'est terminé mais la clé n'est pas en exFAT (système actuel : " + after.fs + L").");
+    post_log(L"Formatage vérifié : exFAT, " + human(after.size));
 }
 
 static void eject_drive(const Drive& sel) {
@@ -1229,8 +1893,9 @@ struct DoneInfo {
     int kind = 0;
     std::wstring msg;
     int job = 0;
+    std::wstring what, version;
 };
-enum { JOB_PREPARE = 1, JOB_FORMAT, JOB_EJECT, JOB_IDENT };
+enum { JOB_PREPARE = 1, JOB_FORMAT, JOB_EJECT, JOB_IDENT, JOB_VERIFY };
 
 struct IdentInfo {
     std::wstring path;
@@ -1274,7 +1939,7 @@ const COLORREF warn = RGB(245, 170, 50);
 const COLORREF closeHot = RGB(196, 43, 28);
 }
 
-enum { IDC_SELECT = 200, IDC_LOGBTN, IDC_MIN, IDC_MAX, IDC_CLOSE, IDC_FILE, IDC_SCROLL, IDC_DEV };
+enum { IDC_SELECT = 200, IDC_LOGBTN, IDC_MIN, IDC_MAX, IDC_CLOSE, IDC_FILE, IDC_SCROLL, IDC_DEV, IDC_STEPS, IDC_CONTENT, IDC_VERIFY, IDC_HISTORY };
 enum BtnKind { BK_PRIMARY, BK_GHOST, BK_DANGER, BK_ICON, BK_FIELD, BK_CAP, BK_CAPCLOSE };
 struct BtnInfo {
     int kind = BK_GHOST;
@@ -1292,7 +1957,9 @@ struct Label {
 struct Ui {
     HWND drives, refresh, driveinfo, version, archives, site, cache, sha, file, select, progress, detail;
     HWND start, cancel, format, eject, logbtn, devbtn, log, scroll, tip, bmin, bmax, bclose;
-    HFONT font = nullptr, semi = nullptr, title = nullptr, small = nullptr, smallSemi = nullptr, mono = nullptr, icon = nullptr, iconCap = nullptr;
+    HWND steps = nullptr, content = nullptr, verify = nullptr, history = nullptr;
+    int baseH = 0;
+    HFONT font = nullptr, semi = nullptr, title = nullptr, small = nullptr, smallSemi = nullptr, mono = nullptr, monoSmall = nullptr, icon = nullptr, iconCap = nullptr;
     HBRUSH bgBrush = nullptr, fieldBrush = nullptr;
     HICON appIcon = nullptr;
     std::wstring uiFont = L"Segoe UI", iconFont = L"Segoe MDL2 Assets", monoFont = L"Consolas";
@@ -1556,12 +2223,12 @@ static const Firmware* selected_fw() {
 
 static bool mega_auto(const Firmware& f) { return !f.mega.empty() && ui.has_mega; }
 
+static std::atomic<wchar_t> g_busy_letter{0};
+static void (*g_on_busy)(bool) = nullptr;
+
 static std::wstring cache_path(const Firmware& f) { return g_cache + L"\\" + f.version + L"\\PS5UPDATE.PUP"; }
 
-static bool in_cache(const Firmware& f) {
-    std::wstring p = cache_path(f);
-    return file_exists(p) && (!f.size || file_size(p) == f.size);
-}
+static bool in_cache(const Firmware& f) { return is_hex(f.sha256, 64) && sidecar_ok(cache_path(f), f.sha256); }
 
 static std::wstring source_tag(const Firmware& f) {
     if (!is_hex(f.sha256, 64)) return L"sans SHA-256";
@@ -1645,28 +2312,37 @@ static void fill_drives() {
 static void apply_busy() {
     bool b = g_busy;
     bool has = selected_drive() != nullptr;
-    for (HWND h : {ui.drives, ui.version, ui.file, ui.select, ui.cache}) EnableWindow(h, !b);
+    const Drive* d = selected_drive();
+    for (HWND h : {ui.drives, ui.version, ui.file, ui.select, ui.cache, ui.history}) EnableWindow(h, !b);
     EnableWindow(ui.refresh, !b && !g_scanning);
     EnableWindow(ui.archives, !b && !g_catalog_loading);
     EnableWindow(ui.start, !b && has);
     EnableWindow(ui.format, !b && has);
     EnableWindow(ui.eject, !b && has);
-    EnableWindow(ui.cancel, b);
+    EnableWindow(ui.verify, !b && d && d->pup_size);
+    EnableWindow(ui.cancel, b && !g_nocancel);
     DragAcceptFiles(g_hwnd, !b);
     set_text(ui.start, b ? L"En cours…" : L"Préparer");
     InvalidateRect(ui.start, nullptr, FALSE);
+    if (g_on_busy) g_on_busy(b);
 }
 
 static void scan_drives() {
     if (g_scanning) return;
-    if (g_busy) { ui.pending_scan = true; return; }
+    if (g_busy) {
+        ui.pending_scan = true;
+        return;
+    }
     g_scanning = true;
     apply_busy();
-    std::thread([] {
+    spawn([] {
         auto* v = new std::vector<Drive>();
-        try { *v = list_usb(); } catch (...) {}
-        PostMessageW(g_hwnd, WM_DRIVES, 0, (LPARAM)v);
-    }).detach();
+        try {
+            *v = list_usb();
+        } catch (...) {
+        }
+        post_obj(WM_DRIVES, v);
+    });
 }
 
 static void load_catalog() {
@@ -1674,23 +2350,26 @@ static void load_catalog() {
     g_catalog_loading = true;
     apply_busy();
     post_log(L"Lecture des archives communautaires…");
-    std::thread([] {
-        auto* c = new Catalog(scan_catalog());
-        PostMessageW(g_hwnd, WM_CATALOG, 0, (LPARAM)c);
-    }).detach();
+    spawn([] { post_obj(WM_CATALOG, new Catalog(scan_catalog())); });
 }
 
-static void run_job(int job, std::function<std::wstring()> fn) {
+static void run_job(int job, std::function<std::wstring()> fn, const std::wstring& what = L"", wchar_t letter = 0, const std::wstring& version = L"") {
     g_cancel = false;
+    g_device_lost = false;
+    g_busy_letter = letter;
+    g_step = -1;
     g_busy = true;
     apply_busy();
     set_status(L"Démarrage…");
     set_bar(0);
     set_text(ui.detail, L"");
-    std::thread([job, fn] {
+    InvalidateRect(ui.steps, nullptr, FALSE);
+    spawn([job, fn, what, version] {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         auto* d = new DoneInfo;
         d->job = job;
+        d->what = what;
+        d->version = version;
         try {
             d->msg = fn();
             d->kind = 0;
@@ -1705,11 +2384,58 @@ static void run_job(int job, std::function<std::wstring()> fn) {
             d->msg = W(e.what());
         }
         CoUninitialize();
-        PostMessageW(g_hwnd, WM_DONE, 0, (LPARAM)d);
-    }).detach();
+        post_obj(WM_DONE, d);
+    });
 }
 
 static int ask(const std::wstring& text, const wchar_t* title, UINT flags) { return MessageBoxW(g_hwnd, text.c_str(), title, flags); }
+
+static HRESULT CALLBACK danger_cb(HWND h, UINT n, WPARAM wp, LPARAM, LONG_PTR) {
+    if (n == TDN_CREATED) SendMessageW(h, TDM_ENABLE_BUTTON, 1001, FALSE);
+    if (n == TDN_VERIFICATION_CLICKED) SendMessageW(h, TDM_ENABLE_BUTTON, 1001, wp ? TRUE : FALSE);
+    return S_OK;
+}
+
+static bool confirm_danger(HWND owner, const wchar_t* title, const std::wstring& main, const std::wstring& content, const wchar_t* action) {
+    TASKDIALOG_BUTTON b[] = {{1001, action}, {IDCANCEL, L"Annuler"}};
+    TASKDIALOGCONFIG c{};
+    c.cbSize = sizeof c;
+    c.hwndParent = owner;
+    c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    c.pszWindowTitle = title;
+    c.pszMainIcon = TD_WARNING_ICON;
+    c.pszMainInstruction = main.c_str();
+    c.pszContent = content.c_str();
+    c.cButtons = 2;
+    c.pButtons = b;
+    c.nDefaultButton = IDCANCEL;
+    c.pszVerificationText = L"Je comprends que cette action est irréversible";
+    c.pfCallback = danger_cb;
+    int btn = 0;
+    BOOL ver = FALSE;
+    if (FAILED(TaskDialogIndirect(&c, &btn, nullptr, &ver)))
+        return MessageBoxW(owner, (main + L"\n\n" + content).c_str(), title, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
+    return btn == 1001 && ver;
+}
+
+static std::wstring history_path() { return g_cache + L"\\historique.log"; }
+
+static void add_history(const std::wstring& what, int kind, const std::wstring& msg) {
+    if (what.empty()) return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    std::wstring m = msg;
+    for (auto& c : m)
+        if (c == L'\n' || c == L'\r' || c == L'\t') c = L' ';
+    if (m.size() > 160) m = m.substr(0, 160) + L"…";
+    const wchar_t* res[] = {L"OK     ", L"ANNULÉ ", L"ÉCHEC  "};
+    std::wstring line = F(L"%04d-%02d-%02d %02d:%02d  ", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute) + res[std::max(0, std::min(2, kind))] + what + L"  ·  " + m;
+    auto lines = read_lines(history_path());
+    lines.push_back(line);
+    if (lines.size() > 500) lines.erase(lines.begin(), lines.begin() + (lines.size() - 500));
+    make_dirs(g_cache);
+    write_lines(history_path(), lines);
+}
 
 static void identify_local(const std::wstring& path) {
     if (g_busy) return;
@@ -1722,7 +2448,7 @@ static void identify_local(const std::wstring& path) {
         info->path = path;
         info->size = n;
         try {
-            info->sha = hash_file(path, false, L"Identification du PUP", &info->md5);
+            info->sha = hash_file(path, HM_BUFFERED, L"Identification du PUP", &info->md5);
         } catch (...) {
             delete info;
             throw;
@@ -1775,14 +2501,25 @@ static void start_eject();
 static void start_prepare() {
     const Drive* dp = selected_drive();
     const Firmware* fp = selected_fw();
-    if (!dp) { ask(L"Sélectionne une clé USB.", APP_NAME, MB_ICONWARNING); return; }
-    if (!fp || !is_hex(fp->sha256, 64)) { ask(L"Cette version n'a pas de SHA-256 de référence : copie bloquée.", APP_NAME, MB_ICONERROR); return; }
+    if (!dp) {
+        ask(L"Sélectionne une clé USB.", APP_NAME, MB_ICONWARNING);
+        return;
+    }
+    if (!fp || !is_hex(fp->sha256, 64)) {
+        ask(L"Cette version n'a pas de SHA-256 de référence : copie bloquée.", APP_NAME, MB_ICONERROR);
+        return;
+    }
     Drive d = *dp;
     Firmware fw = *fp;
+    if (!d.writable) {
+        ask(L"La clé " + std::wstring(1, d.letter) + L": est protégée en écriture. Retire le verrou (s'il y en a un) ou utilise une autre clé.", APP_NAME, MB_ICONERROR);
+        return;
+    }
     if (!d.fs_ok()) {
-        if (ask(L"La clé " + std::wstring(1, d.letter) + L": est en " + d.fs + L", que la PS5 ne lit pas.\n\nLa formater en exFAT maintenant ?\nTOUTES ses données seront effacées.", APP_NAME,
-                MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES)
-            run_job(JOB_FORMAT, [d]() { format_drive(d); return std::wstring(L"Clé formatée en exFAT. Relance « Préparer »."); });
+        if (confirm_danger(g_hwnd, L"Formater la clé", L"La clé " + std::wstring(1, d.letter) + L": est en " + d.fs + L" : la PS5 ne peut pas la lire.",
+                           L"Formater en exFAT maintenant ? TOUTES les données de « " + (d.model.empty() ? std::wstring(L"Clé USB") : d.model) + L" » (" + human(d.size) + L") seront effacées.",
+                           L"Formater et tout effacer"))
+            run_job(JOB_FORMAT, [d]() { format_drive(d); return std::wstring(L"Clé formatée en exFAT. Relance « Préparer »."); }, F(L"Formatage %lc: (%ls)", d.letter, d.model.c_str()), d.letter);
         return;
     }
     bool use_local = !g_local_path.empty() && g_local_version == fw.version;
@@ -1794,23 +2531,24 @@ static void start_prepare() {
         return;
     }
     std::wstring cached = cache_path(fw);
-    bool have_cache = in_cache(fw);
+    bool have_cache = file_exists(cached) && (!fw.size || file_size(cached) == fw.size);
     if (!use_local && !have_cache && fw.direct.empty() && !mega_auto(fw)) {
         if (!fw.mega.empty()) {
-            if (ask(L"Cette version n'est disponible que sur MEGA.\n\nOuvrir le lien dans le navigateur ? Une fois téléchargé, sélectionne ou glisse le .PUP dans la fenêtre.\n(Ou installe MEGAcmd pour le téléchargement automatique.)", APP_NAME,
-                    MB_ICONINFORMATION | MB_YESNO) == IDYES)
+            if (ask(L"Cette version n'est disponible que sur MEGA.\n\nOuvrir le lien dans le navigateur ? Une fois téléchargé, sélectionne ou glisse le .PUP dans la fenêtre.\n(Ou installe MEGAcmd pour le téléchargement automatique.)",
+                    APP_NAME, MB_ICONINFORMATION | MB_YESNO) == IDYES)
                 ShellExecuteW(g_hwnd, L"open", fw.mega.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         } else ask(L"Aucun lien pour cette version. Télécharge le PUP puis sélectionne-le.", APP_NAME, MB_ICONINFORMATION);
         return;
     }
     uint64_t need = use_local ? file_size(g_local_path) : (have_cache ? file_size(cached) : fw.size);
-    std::wstring fin = d.root() + L"PS5\\UPDATE\\PS5UPDATE.PUP";
-    uint64_t old = file_exists(fin) ? file_size(fin) : 0;
+    uint64_t old = d.pup_size;
     bool delete_old = false;
-    if (old && ask(L"Un PS5UPDATE.PUP existe déjà sur " + d.root() + L".\nLe remplacer (après vérification du nouveau) ?", APP_NAME, MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+    if (old && ask(L"Un PS5UPDATE.PUP existe déjà sur " + d.root() + L".\nIl sera remplacé seulement après vérification complète du nouveau. Continuer ?", APP_NAME, MB_ICONQUESTION | MB_YESNO) != IDYES) return;
     if (need && d.free < need + HEADROOM) {
         if (old && d.free + old >= need + HEADROOM) {
-            if (ask(L"Pas assez de place pour garder l'ancien PUP pendant la copie.\nSupprimer l'ancien d'abord ?", APP_NAME, MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+            if (!confirm_danger(g_hwnd, L"Remplacer l'ancien PUP", L"Pas assez de place pour garder l'ancien PUP pendant la copie.",
+                                L"L'ancien PS5UPDATE.PUP sera sauvegardé sur le PC, retiré de la clé, puis restauré automatiquement si la préparation échoue.", L"Retirer l'ancien PUP"))
+                return;
             delete_old = true;
         } else {
             ask(L"Espace insuffisant sur la clé : " + human(d.free) + L" libres, il faut " + human(need + HEADROOM) + L".", APP_NAME, MB_ICONERROR);
@@ -1818,35 +2556,73 @@ static void start_prepare() {
         }
     }
     std::wstring how = use_local ? L"fichier local" : have_cache ? L"cache local" : !fw.direct.empty() ? L"téléchargement HTTPS" : L"MEGAcmd";
+    std::wstring refs;
+    for (auto& r : fw.refs) refs += (refs.empty() ? L"" : L", ") + r;
     if (ask(L"Firmware : " + fw.version + L"  (" + how + L")\nClé : " + d.root() + L"  " + d.model + L"  ·  " + d.fs + L"  ·  " + human(d.size) +
-                L"\n\nSeul PS5\\UPDATE\\PS5UPDATE.PUP sera créé ou remplacé. La clé ne sera pas formatée.\nUne PS5 peut refuser une version plus ancienne que la sienne.\n\nContinuer ?",
+                L"\n\nSeul PS5\\UPDATE\\PS5UPDATE.PUP sera créé ou remplacé. La clé ne sera pas formatée." + L"\nEmpreinte de référence : " + (refs.empty() ? L"—" : refs) +
+                L" (références communautaires, aucune signature Sony vérifiable ici).\nUne PS5 peut refuser une version plus ancienne que la sienne.\n\nContinuer ?",
             L"Préparer la clé", MB_ICONQUESTION | MB_YESNO) != IDYES)
         return;
     std::wstring local = use_local ? g_local_path : L"";
-    run_job(JOB_PREPARE, [d, fw, local, delete_old]() {
-        make_dirs(g_cache);
-        bool from_cache = false;
-        std::wstring src = local.empty() ? acquire(fw, from_cache) : local;
-        copy_and_verify(src, d, fw, from_cache, delete_old);
-        return d.root() + L"PS5\\UPDATE\\PS5UPDATE.PUP";
-    });
+    run_job(
+        JOB_PREPARE,
+        [d, fw, local, delete_old]() {
+            make_dirs(g_cache);
+            bool from_cache = false;
+            std::wstring src;
+            if (local.empty()) src = acquire(fw, from_cache);
+            else {
+                set_step(2);
+                src = local;
+            }
+            copy_and_verify(src, d, fw, from_cache, delete_old);
+            set_step(4);
+            return d.root() + L"PS5\\UPDATE\\PS5UPDATE.PUP";
+        },
+        F(L"Préparation %ls → %lc: (%ls)", fw.version.c_str(), d.letter, d.model.c_str()), d.letter, fw.version);
 }
 
 static void start_format() {
     const Drive* dp = selected_drive();
     if (!dp) return;
     Drive d = *dp;
-    if (ask(F(L"Formater %lc:  %ls  (%ls) en exFAT ?\n\nTOUTES LES DONNÉES DE CETTE CLÉ SERONT EFFACÉES.\nWindows va demander les droits administrateur.", d.letter, d.model.c_str(), human(d.size).c_str()),
-            L"Formater la clé", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+    if (!confirm_danger(g_hwnd, L"Formater la clé", F(L"Effacer TOUTES les données de %lc: ?", d.letter),
+                        (d.model.empty() ? std::wstring(L"Clé USB") : d.model) + L"  ·  " + human(d.size) + L"  ·  " + d.fs +
+                            L"\n\nLa clé sera formatée en exFAT (nom PS5). Windows va demander les droits administrateur. L'opération ne peut pas être interrompue une fois lancée.",
+                        L"Formater et tout effacer"))
         return;
-    run_job(JOB_FORMAT, [d]() { format_drive(d); return std::wstring(L"Clé formatée en exFAT (nom PS5)"); });
+    run_job(JOB_FORMAT, [d]() { format_drive(d); return std::wstring(L"Clé formatée en exFAT (nom PS5)"); }, F(L"Formatage %lc: (%ls)", d.letter, d.model.c_str()), d.letter);
 }
 
 static void start_eject() {
     const Drive* dp = selected_drive();
     if (!dp) return;
     Drive d = *dp;
-    run_job(JOB_EJECT, [d]() { eject_drive(d); return F(L"%lc: peut être retirée en toute sécurité", d.letter); });
+    run_job(JOB_EJECT, [d]() { eject_drive(d); return F(L"%lc: peut être retirée en toute sécurité", d.letter); }, F(L"Éjection %lc: (%ls)", d.letter, d.model.c_str()), d.letter);
+}
+
+static void start_verify() {
+    const Drive* dp = selected_drive();
+    if (!dp || !dp->pup_size) return;
+    Drive d = *dp;
+    std::map<std::string, std::wstring> known;
+    for (auto& kv : g_catalog)
+        if (is_hex(kv.second.sha256, 64)) known[kv.second.sha256] = kv.first;
+    run_job(
+        JOB_VERIFY,
+        [d, known]() {
+            Drive cur = recheck_drive(d);
+            if (!cur.pup_size) fail(L"Aucun PS5UPDATE.PUP sur la clé.");
+            set_step(3);
+            check_header(cur.pup_path());
+            std::string sha = hash_file(cur.pup_path(), HM_DIRECT, L"Vérification du PUP sur la clé");
+            auto it = known.find(sha);
+            if (it == known.end()) fail(L"Le PUP présent sur la clé ne correspond à aucune référence connue (fichier modifié, Recovery ou corrompu).\nSHA-256 : " + W(sha));
+            record_usb_verified(recheck_drive(d), it->second);
+            post_log(L"Structure du PUP : " + inspect_pup(cur.pup_path()).summary);
+            return L"PUP sur la clé intègre : firmware " + it->second;
+        },
+        F(L"Vérification %lc: (%ls)", d.letter, d.model.c_str()), d.letter);
 }
 
 static bool font_exists(const wchar_t* name) {
@@ -1865,7 +2641,7 @@ static HFONT mkfont(const std::wstring& face, double pt, int weight) {
 }
 
 static void make_fonts() {
-    for (HFONT f : {ui.font, ui.semi, ui.title, ui.small, ui.smallSemi, ui.mono, ui.icon, ui.iconCap})
+    for (HFONT f : {ui.font, ui.semi, ui.title, ui.small, ui.smallSemi, ui.mono, ui.monoSmall, ui.icon, ui.iconCap})
         if (f) DeleteObject(f);
     ui.font = mkfont(ui.uiFont, 9, FW_NORMAL);
     ui.semi = mkfont(ui.uiFont, 9, FW_SEMIBOLD);
@@ -1873,10 +2649,11 @@ static void make_fonts() {
     ui.small = mkfont(ui.uiFont, 8, FW_NORMAL);
     ui.smallSemi = mkfont(ui.uiFont, 8, FW_BOLD);
     ui.mono = mkfont(ui.monoFont, 8, FW_NORMAL);
+    ui.monoSmall = mkfont(ui.monoFont, 7.5, FW_NORMAL);
     ui.icon = mkfont(ui.iconFont, 9, FW_NORMAL);
     ui.iconCap = mkfont(ui.iconFont, 7, FW_NORMAL);
     EnumChildWindows(g_hwnd, [](HWND c, LPARAM) -> BOOL { SendMessageW(c, WM_SETFONT, (WPARAM)ui.font, TRUE); return TRUE; }, 0);
-    SendMessageW(ui.sha, WM_SETFONT, (WPARAM)ui.mono, TRUE);
+    SendMessageW(ui.sha, WM_SETFONT, (WPARAM)ui.monoSmall, TRUE);
     SendMessageW(ui.log, WM_SETFONT, (WPARAM)ui.mono, TRUE);
     SendMessageW(ui.detail, WM_SETFONT, (WPARAM)ui.small, TRUE);
     for (HWND cb : {ui.drives, ui.version}) {
@@ -1889,16 +2666,7 @@ static void make_fonts() {
 
 static bool sb_update();
 
-static int content_height(bool with_log) {
-    int h = S(42) + S(10);
-    h += S(30) + S(18) + S(32) + S(10) + S(18) + S(30) + S(14);
-    h += S(30) + S(18) + S(32) + S(10) + S(18) + S(30) + S(10) + S(18) + S(28) + S(14);
-    h += S(30) + S(30) + S(22) + S(10);
-    h += S(34) + S(14);
-    if (with_log) h += S(LOG_H);
-    h += S(28);
-    return h;
-}
+static int content_height(bool with_log) { return (ui.baseH ? ui.baseH : S(760)) + (with_log ? S(LOG_H) : 0); }
 
 static void layout() {
     RECT rc;
@@ -1917,53 +2685,62 @@ static void layout() {
         y += S(30);
     };
     auto label = [&](const wchar_t* t, int lx, int lw) { ui.labels.push_back({{lx, y, lx + lw, y + S(16)}, t, false}); };
-    int fh = S(30), gap = S(8);
+    int fh = S(30), gap = S(8), ib = S(30);
 
     section(L"Périphérique");
     label(L"Clé USB", x, cw);
     y += S(18);
-    place(ui.drives, x, y, cw - S(30) - gap, S(300));
-    place(ui.refresh, x + cw - S(30), y, S(30), fh);
+    place(ui.drives, x, y, cw - 3 * ib - 3 * gap, S(300));
+    place(ui.refresh, x + cw - 3 * ib - 2 * gap, y, ib, fh);
+    place(ui.eject, x + cw - 2 * ib - gap, y, ib, fh);
+    place(ui.format, x + cw - ib, y, ib, fh);
     y += S(32) + S(10);
     label(L"Système de fichiers", x, cw / 2);
     label(L"Espace libre", x + cw / 2 + gap / 2, cw / 2);
     y += S(18);
     place(ui.driveinfo, x, y, cw, fh);
+    y += S(30) + S(10);
+    label(L"Contenu de la clé", x, cw);
+    y += S(18);
+    place(ui.content, x, y, cw - S(100) - gap, fh);
+    place(ui.verify, x + cw - S(100), y, S(100), fh);
     y += S(30) + S(14);
 
     section(L"Firmware");
     label(L"Version", x, cw);
     y += S(18);
-    place(ui.version, x, y, cw - 2 * S(30) - 2 * gap, S(300));
-    place(ui.archives, x + cw - 2 * S(30) - gap, y, S(30), fh);
-    place(ui.site, x + cw - S(30), y, S(30), fh);
+    place(ui.version, x, y, cw - 2 * ib - 2 * gap, S(300));
+    place(ui.archives, x + cw - 2 * ib - gap, y, ib, fh);
+    place(ui.site, x + cw - ib, y, ib, fh);
     y += S(32) + S(10);
     label(L"Fichier PUP", x, cw);
     y += S(18);
     place(ui.file, x, y, cw - S(100) - gap, fh);
     place(ui.select, x + cw - S(100), y, S(100), fh);
     y += S(30) + S(10);
-    label(L"Empreinte SHA-256", x, cw);
+    label(L"Empreinte SHA-256 de référence", x, cw);
     y += S(18);
     ui.shaField = {x, y, x + cw, y + S(28)};
-    place(ui.sha, x + S(10), y + S(7), cw - S(20), S(16));
+    place(ui.sha, x + S(10), y + S(7), cw - S(18) - S(78), S(16));
     y += S(28) + S(14);
 
     section(L"Statut");
+    place(ui.steps, x, y, cw, S(24));
+    y += S(24) + S(8);
     place(ui.progress, x, y, cw, S(30));
     y += S(30) + S(4);
     place(ui.detail, x, y, cw, S(18));
     y += S(18) + S(10);
 
-    int bh = S(34), ib = S(34);
-    place(ui.logbtn, x, y, ib, bh);
-    place(ui.cache, x + (ib + S(6)), y, ib, bh);
-    place(ui.format, x + 2 * (ib + S(6)), y, ib, bh);
-    place(ui.eject, x + 3 * (ib + S(6)), y, ib, bh);
-    place(ui.devbtn, x + 4 * (ib + S(6)), y, ib, bh);
+    int bh = S(34), sb = S(34);
+    place(ui.logbtn, x, y, sb, bh);
+    place(ui.history, x + (sb + S(6)), y, sb, bh);
+    place(ui.cache, x + 2 * (sb + S(6)), y, sb, bh);
+    place(ui.devbtn, x + 3 * (sb + S(6)), y, sb, bh);
     place(ui.cancel, x + cw - S(96), y, S(96), bh);
     place(ui.start, x + cw - S(96) - gap - S(124), y, S(124), bh);
     y += bh + S(14);
+    ui.baseH = y + S(28);
 
     ui.footerTop = rc.bottom - S(28);
     if (ui.log_visible) {
@@ -2006,6 +2783,16 @@ static void paint(HDC hdc) {
         } else draw_text(dc, l.text, l.r, ui.small, C::dim, DT_LEFT | DT_TOP | DT_SINGLELINE);
     }
     rrect(dc, ui.shaField, S(6), C::field, C::fieldBorder);
+    if (const Firmware* f = selected_fw()) {
+        size_t n = f->refs.size();
+        std::wstring t = n == 0 ? L"aucune source" : n == 1 ? L"1 source" : F(L"%d sources", (int)n);
+        int tw = text_width(dc, t, ui.smallSemi) + S(16);
+        int hh = ui.shaField.bottom - ui.shaField.top;
+        RECT c{ui.shaField.right - S(6) - tw, ui.shaField.top + (hh - S(18)) / 2, ui.shaField.right - S(6), ui.shaField.top + (hh - S(18)) / 2 + S(18)};
+        bool good = n >= 2;
+        rrect(dc, c, S(9), good ? C::okBg : RGB(58, 46, 22), CLR_NONE);
+        draw_text(dc, t, c, ui.smallSemi, good ? C::ok : C::warn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
     if (ui.log_visible) rrect(dc, ui.logField, S(8), C::field, C::fieldBorder);
 
     fill(dc, {0, ui.footerTop, rc.right, rc.bottom}, C::caption);
@@ -2208,6 +2995,70 @@ static void draw_driveinfo(DRAWITEMSTRUCT* di) {
     int bw = S(44), bx = b.right - S(10) - bw, by = (h - S(4)) / 2;
     rrect(dc, {bx, by, bx + bw, by + S(4)}, S(2), RGB(40, 45, 57), CLR_NONE);
     rrect(dc, {bx, by, bx + std::max(S(4), (int)(bw * pct / 100)), by + S(4)}, S(2), pct > 90 ? C::warn : C::accentHi, CLR_NONE);
+}
+
+static void draw_steps(DRAWITEMSTRUCT* di) {
+    RECT r = di->rcItem;
+    int w = r.right - r.left, h = r.bottom - r.top;
+    MemDC mem(di->hDC, w, h);
+    HDC dc = mem.dc;
+    fill(dc, {0, 0, w, h}, C::bg);
+    const wchar_t* names[] = {L"Téléchargement", L"Vérification", L"Copie", L"Relecture"};
+    int step = g_step, gap = S(6), cwid = (w - 3 * gap) / 4;
+    for (int i = 0; i < 4; i++) {
+        RECT c{i * (cwid + gap), 0, i * (cwid + gap) + cwid, h};
+        bool done = step > i, cur = step == i;
+        COLORREF bgc = done ? C::okBg : cur ? C::sel : C::field, br = done ? RGB(36, 110, 76) : cur ? C::accent : C::fieldBorder;
+        COLORREF fg = done ? C::ok : cur ? C::text : C::faint;
+        rrect(dc, c, S(12), bgc, br);
+        int tw = text_width(dc, names[i], ui.small) + (done ? S(16) : 0);
+        int x0 = c.left + (cwid - tw) / 2;
+        if (done) {
+            icon(dc, 0xE73E, {x0, 0, x0 + S(12), h}, C::ok, S(12));
+            x0 += S(16);
+        }
+        draw_text(dc, names[i], {x0, 0, c.right, h}, cur ? ui.smallSemi : ui.small, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+}
+
+static void draw_content(DRAWITEMSTRUCT* di) {
+    RECT r = di->rcItem;
+    int w = r.right - r.left, h = r.bottom - r.top;
+    MemDC mem(di->hDC, w, h);
+    HDC dc = mem.dc;
+    fill(dc, {0, 0, w, h}, C::bg);
+    const Drive* d = selected_drive();
+    std::wstring t;
+    COLORREF col = C::faint;
+    wchar_t ic = 0;
+    COLORREF icc = C::faint;
+    bool green = false;
+    if (!d) t = L"—";
+    else if (!d->fs_ok()) t = L"Illisible par la PS5 tant que la clé n'est pas en FAT32/exFAT";
+    else {
+        UsbState st = usb_state(*d);
+        if (st.state == 0) t = L"Aucun firmware sur la clé";
+        else if (st.state == 2) {
+            t = L"Firmware " + st.version + L" vérifié le " + st.when + L"  ·  " + human(d->pup_size);
+            col = C::ok;
+            ic = 0xE73E;
+            icc = C::ok;
+            green = true;
+        } else {
+            t = L"PS5UPDATE.PUP présent (" + human(d->pup_size) + L"), intégrité inconnue";
+            col = C::warn;
+            ic = 0xE7BA;
+            icc = C::warn;
+        }
+        if (d->stale_tmp) t += L"  ·  fichier temporaire abandonné";
+    }
+    rrect(dc, {0, 0, w, h}, S(6), C::field, green ? RGB(36, 110, 76) : C::fieldBorder);
+    int x = S(10);
+    if (ic) {
+        icon(dc, ic, {S(8), 0, S(28), h}, icc, S(14));
+        x = S(32);
+    }
+    draw_text(dc, t, {x, 0, w - S(8), h}, ui.font, col, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 static void draw_bar(DRAWITEMSTRUCT* di) {
@@ -2496,6 +3347,10 @@ static void create_controls() {
     ui.format = mkbtn(L"", IDC_FORMAT, BK_DANGER, 0xE74D);
     ui.eject = mkbtn(L"", IDC_EJECT, BK_ICON, 0xE898);
     ui.devbtn = mkbtn(L"", IDC_DEV, BK_ICON, 0xEC7A);
+    ui.history = mkbtn(L"", IDC_HISTORY, BK_ICON, 0xE81E);
+    ui.verify = mkbtn(L"Vérifier", IDC_VERIFY, BK_GHOST, 0xE73E);
+    ui.content = mk(WC_STATICW, L"", SS_OWNERDRAW, IDC_CONTENT);
+    ui.steps = mk(WC_STATICW, L"", SS_OWNERDRAW, IDC_STEPS);
     ui.start = mkbtn(L"Préparer", IDC_START, BK_PRIMARY, 0xE88E);
     ui.cancel = mkbtn(L"Annuler", IDC_CANCEL, BK_GHOST, 0);
     ui.log = mk(WC_EDITW, L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG);
@@ -2518,6 +3373,8 @@ static void create_controls() {
     add_tip(ui.format, L"Formater la clé en exFAT (efface tout)");
     add_tip(ui.eject, L"Éjecter la clé en toute sécurité");
     add_tip(ui.devbtn, L"Outils développeur (Ctrl+Maj+D)");
+    add_tip(ui.history, L"Historique des opérations");
+    add_tip(ui.verify, L"Relire le PUP présent sur la clé et l'identifier");
     add_tip(ui.sha, L"Cliquer pour copier");
     add_tip(ui.bmin, L"Réduire");
     add_tip(ui.bmax, L"Agrandir");
@@ -2553,41 +3410,61 @@ static void toggle_log() {
     if (ui.log_visible) SendMessageW(ui.log, EM_SCROLLCARET, 0, 0);
 }
 
+static void offer_partial_cleanup(const std::wstring& version) {
+    if (version.empty()) return;
+    std::wstring part = g_cache + L"\\" + version + L"\\PS5UPDATE.PUP.part";
+    if (!file_exists(part) || !file_size(part)) return;
+    if (ask(L"Un téléchargement partiel de " + human(file_size(part)) + L" est conservé pour reprendre plus tard sans tout retélécharger.\n\nLe garder ?", APP_NAME,
+            MB_ICONQUESTION | MB_YESNO) == IDYES)
+        return;
+    bool ok = DeleteFileW(part.c_str());
+    DeleteFileW((g_cache + L"\\" + version + L"\\PS5UPDATE.PUP.part.meta").c_str());
+    log_line(ok ? L"Téléchargement partiel supprimé" : L"Suppression du téléchargement partiel impossible : " + win_error(GetLastError()));
+}
+
 static void on_done(DoneInfo* d) {
     std::unique_ptr<DoneInfo> g(d);
     g_busy = false;
+    g_busy_letter = 0;
     set_marquee(false);
+    add_history(d->what, d->kind, d->kind == 0 ? (d->msg.empty() ? std::wstring(L"terminé") : d->msg) : d->msg);
     if (ui.closing) {
         DestroyWindow(g_hwnd);
         return;
     }
     apply_busy();
+    InvalidateRect(ui.steps, nullptr, FALSE);
     if (ui.tb) ui.tb->SetProgressState(g_hwnd, d->kind == 2 ? TBPF_ERROR : TBPF_NOPROGRESS);
+    bool rescan = d->job == JOB_FORMAT || d->job == JOB_EJECT || d->job == JOB_PREPARE || d->job == JOB_VERIFY || ui.pending_scan;
+    ui.pending_scan = false;
+    if (rescan) scan_drives();
     if (d->kind == 0) {
         if (d->job == JOB_IDENT) {
             set_status(L"Prêt");
             set_text(ui.detail, L"");
             set_bar(0);
-        } else {
-            set_bar(1000, C::ok);
-            if (d->job == JOB_PREPARE) {
-                set_status(L"Clé prête et vérifiée", C::ok);
-                set_text(ui.detail, d->msg);
-                log_line(L"Succès : " + d->msg);
-                fill_versions();
-                if (ask(L"Firmware copié et relu depuis la clé :\n" + d->msg +
-                            L"\n\nSur la PS5 : Paramètres › Système › Logiciel système › Mise à jour › Mettre à jour depuis une clé USB.\n\nÉjecter la clé maintenant ?",
-                        L"Clé prête", MB_ICONINFORMATION | MB_YESNO) == IDYES) {
-                    start_eject();
-                    return;
-                }
-            } else {
-                set_status(d->msg, C::ok);
-                set_text(ui.detail, L"");
-                log_line(d->msg);
-            }
+            g_step = -1;
+            InvalidateRect(ui.steps, nullptr, FALSE);
+            return;
         }
-    } else if (d->kind == 1) {
+        set_bar(1000, C::ok);
+        if (d->job == JOB_PREPARE) {
+            set_status(L"Clé prête et vérifiée", C::ok);
+            set_text(ui.detail, d->msg);
+            log_line(L"Succès : " + d->msg);
+            fill_versions();
+            if (ask(L"Firmware copié et relu depuis la clé :\n" + d->msg +
+                        L"\n\nSur la PS5 : Paramètres › Système › Logiciel système › Mise à jour › Mettre à jour depuis une clé USB.\n\nÉjecter la clé maintenant ?",
+                    L"Clé prête", MB_ICONINFORMATION | MB_YESNO) == IDYES)
+                start_eject();
+            return;
+        }
+        set_status(d->msg, C::ok);
+        set_text(ui.detail, L"");
+        log_line(d->msg);
+        return;
+    }
+    if (d->kind == 1) {
         set_status(L"Annulé", C::warn);
         set_bar(0);
         set_text(ui.detail, L"");
@@ -2599,10 +3476,7 @@ static void on_done(DoneInfo* d) {
         log_line(L"Erreur : " + d->msg);
         ask(d->msg, APP_NAME, MB_ICONERROR);
     }
-    if (d->job == JOB_FORMAT || d->job == JOB_EJECT || ui.pending_scan) {
-        ui.pending_scan = false;
-        scan_drives();
-    }
+    if (d->job == JOB_PREPARE) offer_partial_cleanup(d->version);
 }
 
 
@@ -2755,6 +3629,10 @@ __attribute__((noinline)) static int recurse(int n) {
 static void dev_log(const std::wstring& s) { log_line(L"[dev] " + s); }
 
 static void trigger_crash(int kind) {
+    if (g_busy) {
+        MessageBoxW(dev.wnd, L"Une opération est en cours : les crashs volontaires sont désactivés jusqu'à sa fin.", APP_NAME, MB_ICONWARNING);
+        return;
+    }
     const wchar_t* names[] = {L"exception C++ non capturée", L"violation d'accès (écriture à 0x0)", L"débordement de pile (récursion infinie)"};
     if (MessageBoxW(dev.wnd, (std::wstring(L"Déclencher un crash volontaire : ") + names[kind] + L" ?\n\nPSD va se fermer et écrire un rapport + minidump dans :\n" + crash_dir()).c_str(),
                     L"Crash volontaire", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES)
@@ -2827,7 +3705,7 @@ static std::wstring sim_download() {
     out.close();
     if (!MoveFileExW(part.c_str(), fin.c_str(), MOVEFILE_REPLACE_EXISTING)) fail(L"Renommage : " + win_error(GetLastError()));
     guard.armed = false;
-    std::string sha = hash_file(fin, false, L"SHA-256 du fichier simulé");
+    std::string sha = hash_file(fin, HM_BUFFERED, L"SHA-256 du fichier simulé");
     post_log(L"[dev] SHA-256 : " + W(sha));
     return L"Téléchargement simulé terminé : " + fin.substr(fin.find_last_of(L'\\') + 1);
 }
@@ -2960,13 +3838,13 @@ static std::wstring last_crash_report() {
 static void clear_cache() {
     if (g_busy) { MessageBoxW(dev.wnd, L"Une opération est en cours.", APP_NAME, MB_ICONWARNING); return; }
     uint64_t before = dir_size(g_cache);
-    if (MessageBoxW(dev.wnd, (L"Supprimer les firmwares en cache (" + human(before) + L") ?\nLes rapports de crash sont conservés.").c_str(), L"Vider le cache", MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+    if (!confirm_danger(dev.wnd, L"Vider le cache", L"Supprimer les firmwares en cache (" + human(before) + L") ?", L"Les rapports de crash et l'historique sont conservés. Les téléchargements partiels seront perdus.", L"Vider le cache")) return;
     WIN32_FIND_DATAW fd;
     HANDLE f = FindFirstFileW((g_cache + L"\\*").c_str(), &fd);
     if (f != INVALID_HANDLE_VALUE) {
         do {
             std::wstring n = fd.cFileName;
-            if (n == L"." || n == L".." || n == L"crash") continue;
+            if (n == L"." || n == L".." || n == L"crash" || n == L"historique.log" || n == L"usb_verified.txt") continue;
             std::wstring p = g_cache + L"\\" + n;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(p);
             else DeleteFileW(p.c_str());
@@ -3188,6 +4066,13 @@ static void open_dev() {
             {L"Effacer", IDD_CLEARLOG, BK_GHOST, 0xE894},
         };
         for (auto& b : list) dev.grid.push_back({devbtn(b.t, b.id, b.kind, b.ic), b.id});
+        g_on_busy = [](bool busy) {
+            for (auto& pr : dev.grid)
+                if (pr.second == IDD_SIMDL || pr.second == IDD_SIMERR || pr.second == IDD_CRASH_CPP || pr.second == IDD_CRASH_AV || pr.second == IDD_CRASH_SO || pr.second == IDD_NET ||
+                    pr.second == IDD_BENCH || pr.second == IDD_CLEARCACHE)
+                    EnableWindow(pr.first, !busy);
+        };
+        g_on_busy(g_busy);
         dev.log = CreateWindowExW(0, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 10, 10, dev.wnd, (HMENU)(INT_PTR)IDD_LOG, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(dev.log, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
         SendMessageW(dev.log, WM_SETFONT, (WPARAM)ui.mono, FALSE);
@@ -3263,6 +4148,194 @@ static bool handle_shortcut(const MSG& m) {
     return false;
 }
 
+struct Viewer {
+    HWND wnd = nullptr, edit = nullptr, scroll = nullptr, close = nullptr, open = nullptr, refresh = nullptr;
+    RECT field{};
+    int captionH = 0;
+} hv;
+
+enum { IDV_CLOSE = 400, IDV_OPEN, IDV_REFRESH, IDV_EDIT, IDV_SCROLL };
+
+static void viewer_fill() {
+    auto lines = read_lines(history_path());
+    std::wstring t;
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it)
+        if (!it->empty()) t += *it + L"\r\n";
+    if (t.empty()) t = L"Aucune opération enregistrée pour l'instant.";
+    SetWindowTextW(hv.edit, t.c_str());
+    sb_update(hv.scroll);
+}
+
+static void viewer_layout() {
+    if (!hv.edit) return;
+    RECT rc;
+    GetClientRect(hv.wnd, &rc);
+    int m = S(16), cw = rc.right - 2 * m;
+    hv.captionH = S(40);
+    MoveWindow(hv.close, rc.right - S(46), 0, S(46), S(32), FALSE);
+    int y = hv.captionH + S(12);
+    MoveWindow(hv.refresh, m, y, S(120), S(30), FALSE);
+    MoveWindow(hv.open, m + S(128), y, S(150), S(30), FALSE);
+    y += S(42);
+    hv.field = {m, y, m + cw, rc.bottom - m};
+    int lw = hv.field.right - hv.field.left, lh = hv.field.bottom - hv.field.top;
+    MoveWindow(hv.edit, hv.field.left + S(10), hv.field.top + S(8), lw - S(28), lh - S(14), FALSE);
+    MoveWindow(hv.scroll, hv.field.right - S(14), hv.field.top + S(4), S(12), lh - S(8), FALSE);
+    RedrawWindow(hv.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    sb_update(hv.scroll);
+}
+
+static LRESULT CALLBACK ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_NCCALCSIZE:
+        if (wp) return 0;
+        break;
+    case WM_NCACTIVATE:
+        return DefWindowProcW(h, msg, wp, -1);
+    case WM_NCHITTEST: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(h, &pt);
+        RECT rc;
+        GetClientRect(h, &rc);
+        int b = S(6);
+        bool l = pt.x < b, r = pt.x >= rc.right - b, btm = pt.y >= rc.bottom - b;
+        if (btm && l) return HTBOTTOMLEFT;
+        if (btm && r) return HTBOTTOMRIGHT;
+        if (l) return HTLEFT;
+        if (r) return HTRIGHT;
+        if (btm) return HTBOTTOM;
+        if (pt.y < b) return HTTOP;
+        if (pt.y < hv.captionH) return HTCAPTION;
+        return HTCLIENT;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        {
+            MemDC mem(hdc, rc.right, rc.bottom);
+            HDC dc = mem.dc;
+            fill(dc, rc, C::bg);
+            fill(dc, {0, 0, rc.right, hv.captionH}, C::caption);
+            fill(dc, {0, hv.captionH - 1, rc.right, hv.captionH}, C::border);
+            icon(dc, 0xE81E, {S(14), 0, S(36), hv.captionH}, C::section, S(18));
+            draw_text(dc, L"Historique des opérations", {S(42), 0, rc.right - S(60), hv.captionH}, ui.title, C::text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            rrect(dc, hv.field, S(8), C::field, C::fieldBorder);
+            if (!ui.win11) rrect(dc, {0, 0, rc.right, rc.bottom}, S(8), CLR_NONE, C::border);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_SIZE:
+        if (!ui.win11) {
+            RECT r;
+            GetWindowRect(h, &r);
+            SetWindowRgn(h, CreateRoundRectRgn(0, 0, r.right - r.left + 1, r.bottom - r.top + 1, S(16), S(16)), TRUE);
+        }
+        viewer_layout();
+        return 0;
+    case WM_GETMINMAXINFO:
+        ((MINMAXINFO*)lp)->ptMinTrackSize = {S(420), S(300)};
+        return 0;
+    case WM_DRAWITEM:
+        if (((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) draw_button((DRAWITEMSTRUCT*)lp);
+        return TRUE;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wp, C::field);
+        SetTextColor((HDC)wp, RGB(175, 182, 194));
+        return (LRESULT)ui.fieldBrush;
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDV_CLOSE: ShowWindow(h, SW_HIDE); break;
+        case IDV_REFRESH: viewer_fill(); break;
+        case IDV_OPEN:
+            make_dirs(g_cache);
+            if (!file_exists(history_path())) write_lines(history_path(), {});
+            ShellExecuteW(h, L"open", history_path().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        }
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(h, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static HWND viewbtn(const wchar_t* text, int id, int kind, wchar_t ic) {
+    HWND b = CreateWindowExW(0, WC_BUTTONW, text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10, hv.wnd, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+    g_btn[b] = BtnInfo{kind, ic, false, false};
+    SetWindowSubclass(b, BtnProc, 1, 0);
+    SendMessageW(b, WM_SETFONT, (WPARAM)ui.font, FALSE);
+    return b;
+}
+
+static void open_history() {
+    if (!hv.wnd) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = ViewProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        wc.lpszClassName = L"PSDView";
+        RegisterClassW(&wc);
+        hv.wnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"PSDView", L"PSD — historique", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_CLIPCHILDREN, 0, 0, 10, 10, g_hwnd,
+                                 nullptr, wc.hInstance, nullptr);
+        BOOL on = TRUE;
+        DwmSetWindowAttribute(hv.wnd, 20, &on, sizeof on);
+        int corner = 2;
+        DwmSetWindowAttribute(hv.wnd, 33, &corner, sizeof corner);
+        COLORREF bc = C::border;
+        DwmSetWindowAttribute(hv.wnd, 34, &bc, sizeof bc);
+        MARGINS mg{0, 0, 0, 1};
+        DwmExtendFrameIntoClientArea(hv.wnd, &mg);
+        hv.close = viewbtn(L"", IDV_CLOSE, BK_CAPCLOSE, 0xE8BB);
+        hv.refresh = viewbtn(L"Actualiser", IDV_REFRESH, BK_GHOST, 0xE72C);
+        hv.open = viewbtn(L"Ouvrir le fichier", IDV_OPEN, BK_GHOST, 0xE8A5);
+        hv.edit = CreateWindowExW(0, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 10, 10, hv.wnd, (HMENU)(INT_PTR)IDV_EDIT, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(hv.edit, WM_SETFONT, (WPARAM)ui.mono, FALSE);
+        hv.scroll = attach_scroll(hv.wnd, hv.edit, IDV_SCROLL);
+        RECT mr;
+        GetWindowRect(g_hwnd, &mr);
+        int w = S(640), h = S(420);
+        SetWindowPos(hv.wnd, nullptr, mr.left + (mr.right - mr.left - w) / 2, mr.top + S(80), w, h, SWP_NOZORDER | SWP_FRAMECHANGED);
+        viewer_layout();
+    }
+    viewer_fill();
+    ShowWindow(hv.wnd, SW_SHOWNORMAL);
+    SetForegroundWindow(hv.wnd);
+}
+
+static void cleanup_leftovers() {
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((g_cache + L"\\*").c_str(), &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            std::wstring n = fd.cFileName;
+            if (n == L"." || n == L"..") continue;
+            std::wstring p = g_cache + L"\\" + n;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (file_exists(p + L"\\mega") || GetFileAttributesW((p + L"\\mega").c_str()) != INVALID_FILE_ATTRIBUTES) delete_tree(p + L"\\mega");
+                WIN32_FIND_DATAW fd2;
+                HANDLE f2 = FindFirstFileW((p + L"\\*.new").c_str(), &fd2);
+                if (f2 != INVALID_HANDLE_VALUE) {
+                    do DeleteFileW((p + L"\\" + fd2.cFileName).c_str());
+                    while (FindNextFileW(f2, &fd2));
+                    FindClose(f2);
+                }
+            } else if (n.size() > 4 && n.compare(n.size() - 4, 4, L".new") == 0)
+                DeleteFileW(p.c_str());
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    std::wstring b = g_cache + L"\\backup\\PS5UPDATE.PUP";
+    if (file_exists(b)) log_line(L"Une sauvegarde d'ancien PUP subsiste après une interruption : " + b);
+}
+
 static int frame_thickness() {
     return GetSystemMetricsForDpi(SM_CXFRAME, ui.dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, ui.dpi);
 }
@@ -3325,7 +4398,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (font_exists(L"Cascadia Mono")) ui.monoFont = L"Cascadia Mono";
         ui.bgBrush = CreateSolidBrush(C::bg);
         ui.fieldBrush = CreateSolidBrush(C::field);
-        ui.has_mega = !megacmd().empty();
+        ui.has_mega = !megaclient().empty();
         create_controls();
         apply_dpi(ui.dpi);
         if (auto v = reg_get(L"LastVersion"); !v.empty()) g_selected_version = v;
@@ -3336,6 +4409,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         log_line(std::wstring(APP_NAME) + L" " + APP_VER + L"  ·  cache : " + g_cache);
         log_line(L"Prépare uniquement une clé de mise à jour officielle : ne contourne aucune restriction PS5.");
         check_previous_crash();
+        cleanup_leftovers();
         if (reg_get(L"LogVisible") == L"1") PostMessageW(h, WM_COMMAND, IDC_LOGBTN, 0);
         scan_drives();
         load_catalog();
@@ -3380,6 +4454,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (di->CtlType == ODT_COMBOBOX) draw_combo_item(di);
         else if (di->hwndItem == ui.driveinfo) draw_driveinfo(di);
         else if (di->hwndItem == ui.progress) draw_bar(di);
+        else if (di->hwndItem == ui.steps) draw_steps(di);
+        else if (di->hwndItem == ui.content) draw_content(di);
         return TRUE;
     }
     case WM_CTLCOLORLISTBOX: {
@@ -3443,6 +4519,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             reg_set(L"LogVisible", ui.log_visible ? L"1" : L"0");
             break;
         case IDC_DEV: open_dev(); break;
+        case IDC_HISTORY: open_history(); break;
+        case IDC_VERIFY:
+            if (!g_busy) start_verify();
+            break;
         case IDC_SHA:
             if (code == STN_CLICKED) copy_sha();
             break;
@@ -3450,8 +4530,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_FORMAT: if (!g_busy) start_format(); break;
         case IDC_EJECT: if (!g_busy) start_eject(); break;
         case IDC_CANCEL:
-            if (g_busy) {
+            if (g_busy && !g_nocancel) {
                 g_cancel = true;
+                abort_network();
                 EnableWindow(ui.cancel, FALSE);
                 set_status(L"Annulation…", C::warn);
             }
@@ -3471,8 +4552,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DEVICECHANGE:
+        if (wp == DBT_DEVICEREMOVECOMPLETE && lp && ((DEV_BROADCAST_HDR*)lp)->dbch_devicetype == DBT_DEVTYP_VOLUME) {
+            auto* v = (DEV_BROADCAST_VOLUME*)lp;
+            wchar_t L = g_busy_letter;
+            if (g_busy && L >= L'A' && L <= L'Z' && (v->dbcv_unitmask & (1u << (L - L'A')))) {
+                g_device_lost = true;
+                log_line(F(L"La clé %lc: a été retirée pendant l'opération", L));
+            }
+        }
         if (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE) SetTimer(h, TIMER_DEV, 900, nullptr);
         return TRUE;
+    case WM_STEP:
+        InvalidateRect(ui.steps, nullptr, FALSE);
+        return 0;
+    case WM_NOCANCEL:
+        apply_busy();
+        return 0;
     case WM_TIMER:
         if (wp == TIMER_DEV) {
             KillTimer(h, TIMER_DEV);
@@ -3480,8 +4575,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_ANIM) {
             ui.phase++;
             redraw_bar();
-        } else if (wp == TIMER_CLOSE) {
-            if (!g_busy || ++ui.close_ticks > 60) DestroyWindow(h);
         }
         return 0;
     case WM_LOGMSG: {
@@ -3507,7 +4600,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_busy) {
             g_drives = std::move(*v);
             fill_drives();
-            if (changed) log_line(F(L"%d clé(s) USB détectée(s)", (int)g_drives.size()));
+            if (changed) {
+                log_line(F(L"%d clé(s) USB détectée(s)", (int)g_drives.size()));
+                for (auto& dr : g_drives) {
+                    if (dr.stale_tmp) log_line(F(L"%lc: contient un fichier temporaire abandonné (PS5UPDATE.PUP.tmp) : il sera supprimé à la prochaine préparation", dr.letter));
+                    if (!dr.writable) log_line(F(L"%lc: est protégée en écriture", dr.letter));
+                }
+            }
         }
         apply_busy();
         return 0;
@@ -3529,17 +4628,25 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_CLOSE:
         if (g_busy) {
-            if (ask(L"Une opération est en cours. L'annuler et quitter ?", APP_NAME, MB_ICONQUESTION | MB_YESNO) != IDYES) return 0;
+            if (g_nocancel) {
+                ask(L"Le formatage est en cours et ne peut pas être interrompu sans risque. Attends la fin avant de quitter.", APP_NAME, MB_ICONWARNING);
+                return 0;
+            }
+            if (ui.closing) return 0;
+            if (ask(L"Une opération est en cours. L'arrêter proprement puis quitter ?", APP_NAME, MB_ICONQUESTION | MB_YESNO) != IDYES) return 0;
             ui.closing = true;
             g_cancel = true;
-            ShowWindow(h, SW_HIDE);
-            SetTimer(h, TIMER_CLOSE, 100, nullptr);
+            abort_network();
+            set_status(L"Arrêt en cours, fermeture dès que tout est propre…", C::warn);
+            EnableWindow(ui.cancel, FALSE);
             return 0;
         }
         DestroyWindow(h);
         return 0;
     case WM_DESTROY:
         if (ui.tb) ui.tb->Release();
+        ui.tb = nullptr;
+        g_hwnd = nullptr;
         PostQuitMessage(0);
         return 0;
     }
@@ -3600,6 +4707,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    g_cancel = true;
+    abort_network();
+    join_all();
     if (g_session) WinHttpCloseHandle(g_session);
     Gdiplus::GdiplusShutdown(gtoken);
     CoUninitialize();

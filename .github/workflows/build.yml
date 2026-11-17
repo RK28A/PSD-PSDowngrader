@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths: ['src/**', 'build.sh']
+    paths: ['src/**', 'tests/**', 'build.sh']
   workflow_dispatch:
     inputs:
       release:
@@ -25,10 +25,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install mingw-w64
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends g++-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64
+      - name: Install mingw-w64 + Wine
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends g++-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64 wine64 openssl
       - name: Build PSD.exe
         run: ./build.sh
+      - name: Tests (Wine)
+        env:
+          WINEPREFIX: ${{ runner.temp }}/wine
+          WINEDLLOVERRIDES: mscoree,mshtml=
+        run: |
+          wineboot -i >/dev/null 2>&1 || true
+          ./tests/run.sh
       - uses: actions/upload-artifact@v4
         with:
           name: PSD

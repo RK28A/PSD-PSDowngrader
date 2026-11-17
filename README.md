@@ -35,6 +35,9 @@ Bouton `</>` en bas (ou `Ctrl+Maj+D`) : panneau séparé avec console.
 - MEGA automatique si [MEGAcmd](https://mega.nz/cmd) est installé.
 - Sources : [Darthsternie](https://darthsternie.net/ps5-firmwares/), [Midnight Channel](https://archive.midnightchannel.net/SonyPS/Firmware/index.php?cat=PS5SYS). Empreintes communautaires, pas une signature Sony.
 
+## Tests
+Voir [TESTING.md](TESTING.md) : 44 tests automatiques sous Wine dans GitHub Actions + checklist matérielle.
+
 ## Compiler
 ```sh
 sudo apt install g++-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64
