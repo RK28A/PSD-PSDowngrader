@@ -45,8 +45,8 @@
 #endif
 
 static const wchar_t* APP_NAME = L"PSD";
-static const wchar_t* APP_VER = L"2.1";
-static const wchar_t* UA = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) PSD/2.1";
+static const wchar_t* APP_VER = L"2.2";
+static const wchar_t* UA = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) PSD/2.2";
 static const wchar_t* D_ARCHIVE = L"https://darthsternie.net/ps5-firmwares/";
 static const wchar_t* M_ARCHIVE = L"https://archive.midnightchannel.net/SonyPS/Firmware/index.php?cat=PS5SYS";
 static const uint64_t MiB = 1024ull * 1024ull;
@@ -1380,6 +1380,74 @@ static int text_width(HDC dc, const std::wstring& s, HFONT f) {
     return sz.cx;
 }
 
+
+static void icon(HDC dc, wchar_t id, RECT r, COLORREF c, int box) {
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    float w = (float)(r.right - r.left), h = (float)(r.bottom - r.top);
+    float s = std::min((float)box, std::min(w, h));
+    float k = s / 24.0f, ox = r.left + (w - s) / 2, oy = r.top + (h - s) / 2;
+    Gdiplus::Pen pen(GC(c), std::max(1.25f, 2.0f * k));
+    pen.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound, Gdiplus::DashCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    auto P = [&](float x, float y) { return Gdiplus::PointF(ox + x * k, oy + y * k); };
+    auto line = [&](float a, float b, float c2, float d) { g.DrawLine(&pen, P(a, b), P(c2, d)); };
+    auto poly = [&](std::initializer_list<float> v, bool closed) {
+        std::vector<Gdiplus::PointF> pts;
+        for (auto it = v.begin(); it != v.end(); it += 2) pts.push_back(P(*it, *(it + 1)));
+        if (closed) g.DrawPolygon(&pen, pts.data(), (INT)pts.size());
+        else g.DrawLines(&pen, pts.data(), (INT)pts.size());
+    };
+    auto arc = [&](float cx, float cy, float rad, float a0, float sw) { g.DrawArc(&pen, ox + (cx - rad) * k, oy + (cy - rad) * k, 2 * rad * k, 2 * rad * k, a0, sw); };
+    auto circ = [&](float cx, float cy, float rad) { g.DrawEllipse(&pen, ox + (cx - rad) * k, oy + (cy - rad) * k, 2 * rad * k, 2 * rad * k); };
+    auto box2 = [&](float x, float y, float bw, float bh, float rr) {
+        Gdiplus::GraphicsPath p;
+        round_path(p, ox + x * k, oy + y * k, bw * k, bh * k, rr * k);
+        g.DrawPath(&pen, &p);
+    };
+    auto dot = [&](float x, float y) { line(x, y, x + 0.01f, y); };
+    switch (id) {
+    case 0xE72C: arc(12, 12, 9, 0, 315); line(18.36f, 5.64f, 21, 8); poly({21, 3, 21, 8, 16, 8}, false); break;
+    case 0xE895:
+        arc(12, 12, 9, 180, 135); line(18.36f, 5.64f, 21, 8); poly({21, 3, 21, 8, 16, 8}, false);
+        arc(12, 12, 9, 0, 135); line(5.64f, 18.36f, 3, 16); poly({8, 16, 3, 16, 3, 21}, false);
+        break;
+    case 0xE774: circ(12, 12, 10); line(2, 12, 22, 12); g.DrawEllipse(&pen, ox + 8 * k, oy + 2 * k, 8 * k, 20 * k); break;
+    case 0xE838:
+    case 0xE8B7: poly({2, 6, 2, 18, 4, 20, 20, 20, 22, 18, 22, 9, 20, 7, 12, 7, 10, 4, 4, 4}, true); break;
+    case 0xE896: line(12, 3, 12, 15); poly({7, 10, 12, 15, 17, 10}, false); poly({21, 15, 21, 19, 19, 21, 5, 21, 3, 19, 3, 15}, false); break;
+    case 0xE74E: line(12, 15, 12, 3); poly({7, 8, 12, 3, 17, 8}, false); poly({21, 15, 21, 19, 19, 21, 5, 21, 3, 19, 3, 15}, false); break;
+    case 0xE73E: poly({20, 6, 9, 17, 4, 12}, false); break;
+    case 0xE88E: poly({13, 2, 4, 14, 12, 14, 11, 22, 20, 10, 12, 10}, true); break;
+    case 0xE898: poly({12, 4, 20, 14, 4, 14}, true); line(4, 19, 20, 19); break;
+    case 0xE74D:
+        line(3, 6, 21, 6); poly({19, 6, 19, 20, 17, 22, 7, 22, 5, 20, 5, 6}, false); poly({8, 6, 8, 4, 10, 2, 14, 2, 16, 4, 16, 6}, false);
+        line(10, 11, 10, 17); line(14, 11, 14, 17);
+        break;
+    case 0xE8BB: line(18, 6, 6, 18); line(6, 6, 18, 18); break;
+    case 0xE921: line(5, 12, 19, 12); break;
+    case 0xE922: box2(5, 5, 14, 14, 1.5f); break;
+    case 0xE923: box2(4, 8, 12, 12, 1.5f); poly({8, 8, 8, 5, 9, 4, 19, 4, 20, 5, 20, 15, 19, 16, 16, 16}, false); break;
+    case 0xE70D: poly({6, 9, 12, 15, 18, 9}, false); break;
+    case 0xE81C: box2(2, 4, 20, 16, 2); poly({6, 9, 9, 12, 6, 15}, false); line(12, 15, 17, 15); break;
+    case 0xEC7A: poly({16, 18, 22, 12, 16, 6}, false); poly({8, 6, 2, 12, 8, 18}, false); break;
+    case 0xE7BA: poly({12, 3, 22, 20, 2, 20}, true); line(12, 9, 12, 13); dot(12, 17); break;
+    case 0xE943: poly({7.86f, 2, 16.14f, 2, 22, 7.86f, 22, 16.14f, 16.14f, 22, 7.86f, 22, 2, 16.14f, 2, 7.86f}, true); line(12, 8, 12, 12); dot(12, 16); break;
+    case 0xE964:
+        box2(5, 5, 14, 14, 2); box2(9, 9, 6, 6, 1);
+        line(9, 2, 9, 5); line(15, 2, 15, 5); line(9, 19, 9, 22); line(15, 19, 15, 22);
+        line(2, 9, 5, 9); line(2, 15, 5, 15); line(19, 9, 22, 9); line(19, 15, 22, 15);
+        break;
+    case 0xE81E: poly({12, 2, 22, 7, 12, 12, 2, 7}, true); poly({2, 12, 12, 17, 22, 12}, false); poly({2, 17, 12, 22, 22, 17}, false); break;
+    case 0xE9D9: poly({22, 12, 18, 12, 15, 21, 9, 3, 6, 12, 2, 12}, false); break;
+    case 0xE7F4: box2(2, 3, 20, 14, 2); line(8, 21, 16, 21); line(12, 17, 12, 21); break;
+    case 0xE8A5: poly({14, 2, 6, 2, 4, 4, 4, 20, 6, 22, 18, 22, 20, 20, 20, 8}, true); poly({14, 2, 14, 8, 20, 8}, false); line(8, 13, 16, 13); line(8, 17, 14, 17); break;
+    case 0xE894: circ(12, 12, 10); line(15, 9, 9, 15); line(9, 9, 15, 15); break;
+    default: circ(12, 12, 3); break;
+    }
+}
+
 struct MemDC {
     HDC dst, dc;
     HBITMAP bmp;
@@ -1966,7 +2034,7 @@ static void draw_button(DRAWITEMSTRUCT* di) {
         else if (hot || down) fill(dc, full, down ? C::press : C::hover);
         wchar_t g = b.icon;
         if (di->hwndItem == ui.bmax) g = IsZoomed(g_hwnd) ? 0xE923 : 0xE922;
-        draw_text(dc, std::wstring(1, g), full, ui.iconCap, closeHot ? RGB(255, 255, 255) : C::text, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        icon(dc, g, full, closeHot ? RGB(255, 255, 255) : C::text, S(14));
         return;
     }
     COLORREF bgc, br, fg;
@@ -1994,20 +2062,20 @@ static void draw_button(DRAWITEMSTRUCT* di) {
     }
     if (b.kind == BK_FIELD) {
         COLORREF ic = g_file_ok ? C::ok : C::dim;
-        draw_text(dc, std::wstring(1, b.icon), {S(8), 0, S(30), h}, ui.icon, dis ? C::faint : ic, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        icon(dc, b.icon, {S(8), 0, S(30), h}, dis ? C::faint : ic, S(16));
         draw_text(dc, g_file_text, {S(34), 0, w - S(10), h}, ui.font, dis ? C::faint : (g_file_ok ? C::ok : C::text), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         return;
     }
     wchar_t label[128]{};
     GetWindowTextW(di->hwndItem, label, 128);
     if (b.kind == BK_ICON || !label[0]) {
-        draw_text(dc, std::wstring(1, b.icon), full, ui.icon, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        icon(dc, b.icon, full, fg, S(16));
         return;
     }
     HFONT tf = b.kind == BK_PRIMARY ? ui.semi : ui.font;
     int tw = text_width(dc, label, tf), iw = b.icon ? S(16) + S(8) : 0;
     int x0 = (w - tw - iw) / 2;
-    if (b.icon) draw_text(dc, std::wstring(1, b.icon), {x0, 0, x0 + S(16), h}, ui.icon, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (b.icon) icon(dc, b.icon, {x0, 0, x0 + S(16), h}, fg, S(16));
     draw_text(dc, label, {x0 + iw, 0, x0 + iw + tw + S(2), h}, tf, fg, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -2068,7 +2136,7 @@ static LRESULT CALLBACK ComboProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR
             RECT content{rc.left + 1, rc.top + 1, rc.right - S(30), rc.bottom - 1};
             draw_combo_content(dc, content, h, (int)SendMessageW(h, CB_GETCURSEL, 0, 0), false, dis);
             RECT ar{rc.right - S(30), 0, rc.right - S(6), rc.bottom};
-            draw_text(dc, L"\xE70D", ar, ui.iconCap, dis ? C::faint : C::dim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            icon(dc, 0xE70D, ar, dis ? C::faint : C::dim, S(14));
         }
         EndPaint(h, &ps);
         return 0;
@@ -2961,7 +3029,7 @@ static void dev_paint(HDC hdc) {
     fill(dc, rc, C::bg);
     fill(dc, {0, 0, rc.right, dev.captionH}, C::caption);
     fill(dc, {0, dev.captionH - 1, rc.right, dev.captionH}, C::border);
-    draw_text(dc, L"\xEC7A", {S(14), 0, S(36), dev.captionH}, ui.icon, C::section, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    icon(dc, 0xEC7A, {S(14), 0, S(36), dev.captionH}, C::section, S(18));
     draw_text(dc, L"Outils développeur", {S(42), 0, rc.right - S(60), dev.captionH}, ui.title, C::text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     for (auto& l : dev.labels) {
         if (l.section) {
@@ -3115,7 +3183,7 @@ static void open_dev() {
             {L"Exception C++", IDD_CRASH_CPP, BK_DANGER, 0xE943}, {L"Accès mémoire", IDD_CRASH_AV, BK_DANGER, 0xE964}, {L"Pile infinie", IDD_CRASH_SO, BK_DANGER, 0xE81E},
             {L"Tester le réseau", IDD_NET, BK_GHOST, 0xE774}, {L"Benchmark SHA-256", IDD_BENCH, BK_GHOST, 0xE9D9},
             {L"Infos système", IDD_SYSINFO, BK_GHOST, 0xE7F4}, {L"Exporter le journal", IDD_EXPORT, BK_GHOST, 0xE74E},
-            {L"Dossier des crashs", IDD_CRASHDIR, BK_GHOST, 0xE8B7}, {L"Dernier rapport", IDD_LASTCRASH, BK_GHOST, 0xE8A5},
+            {L"Dossier crashs", IDD_CRASHDIR, BK_GHOST, 0xE8B7}, {L"Dernier rapport", IDD_LASTCRASH, BK_GHOST, 0xE8A5},
             {L"Vider le cache", IDD_CLEARCACHE, BK_DANGER, 0xE74D}, {L"Téléchargements", IDD_DOWNLOADS, BK_GHOST, 0xE896},
             {L"Effacer", IDD_CLEARLOG, BK_GHOST, 0xE894},
         };

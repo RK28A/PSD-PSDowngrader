@@ -1,8 +1,12 @@
+<p align="center"><img src="docs/logo.png" width="96" alt="PSD"></p>
+
 # PSD — PS5 USB Prep
 
 Un seul `PSD.exe` (Windows 10/11 x64), sans installation : prépare une clé USB avec un firmware PS5 **Update** officiel, vérifié par SHA-256 du téléchargement jusqu'à la relecture sur la clé.
 
 > Ne contourne aucune restriction : une PS5 peut refuser une version plus ancienne que la sienne.
+
+<p align="center"><img src="docs/screenshot.png" width="420" alt="PSD"></p>
 
 ## Télécharger
 Onglet **Actions** → dernier build → artefact `PSD`. Les tags `v*` publient aussi l'exe dans **Releases**.
@@ -22,6 +26,8 @@ Bouton `</>` en bas (ou `Ctrl+Maj+D`) : panneau séparé avec console.
 - Crash volontaire : exception C++, violation d'accès, débordement de pile. Rapport texte + minidump dans `%LOCALAPPDATA%\PS5USBPrep\crash`, signalé au lancement suivant.
 - Diagnostic : test réseau, benchmark SHA-256, infos système, export du journal.
 - Fichiers : dossier des crashs, dernier rapport, vider le cache, Téléchargements.
+
+<p align="center"><img src="docs/screenshot-dev.png" width="720" alt="Outils développeur"></p>
 
 ## Notes
 - Cache : `%LOCALAPPDATA%\PS5USBPrep`.
