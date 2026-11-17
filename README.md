@@ -13,6 +13,16 @@ Onglet **Actions** → dernier build → artefact `PSD`. Les tags `v*` publient 
 3. **Préparer la clé** : téléchargement avec reprise, copie dans `PS5\UPDATE\PS5UPDATE.PUP`, relecture directe depuis la clé.
 4. **Éjecter**, puis sur la PS5 : Paramètres › Système › Logiciel système › Mise à jour › Depuis une clé USB.
 
+## Raccourcis
+`F5` rechercher les clés · `Ctrl+O` choisir un PUP · `Ctrl+L` journal · `Ctrl+Maj+D` outils développeur · clic sur le SHA-256 pour le copier.
+
+## Outils développeur
+Bouton `</>` en bas (ou `Ctrl+Maj+D`) : panneau séparé avec console.
+- Simulation : téléchargement de 256 Mio dans *Téléchargements* (avec coupure et reprise simulées), erreur simulée.
+- Crash volontaire : exception C++, violation d'accès, débordement de pile. Rapport texte + minidump dans `%LOCALAPPDATA%\PS5USBPrep\crash`, signalé au lancement suivant.
+- Diagnostic : test réseau, benchmark SHA-256, infos système, export du journal.
+- Fichiers : dossier des crashs, dernier rapport, vider le cache, Téléchargements.
+
 ## Notes
 - Cache : `%LOCALAPPDATA%\PS5USBPrep`.
 - `sha256_references.json` (facultatif, à côté de l'exe) : empreintes supplémentaires.

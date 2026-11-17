@@ -1246,47 +1246,63 @@ using std::min;
 #include <gdiplus.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <dbghelp.h>
+#include <cmath>
+#include <exception>
 
 namespace C {
-const COLORREF bg = RGB(13, 15, 20);
-const COLORREF card = RGB(22, 25, 32);
-const COLORREF border = RGB(36, 40, 50);
-const COLORREF field = RGB(16, 18, 24);
-const COLORREF fieldBorder = RGB(46, 51, 63);
-const COLORREF hover = RGB(32, 36, 47);
-const COLORREF press = RGB(27, 31, 40);
+const COLORREF bg = RGB(17, 19, 25);
+const COLORREF caption = RGB(13, 15, 20);
+const COLORREF border = RGB(40, 44, 55);
+const COLORREF field = RGB(24, 27, 35);
+const COLORREF fieldBorder = RGB(46, 51, 64);
+const COLORREF hover = RGB(34, 38, 49);
+const COLORREF press = RGB(28, 32, 41);
 const COLORREF text = RGB(234, 236, 240);
-const COLORREF dim = RGB(150, 157, 170);
-const COLORREF faint = RGB(98, 105, 118);
+const COLORREF dim = RGB(148, 155, 168);
+const COLORREF faint = RGB(96, 103, 116);
 const COLORREF accent = RGB(0, 112, 209);
 const COLORREF accentHi = RGB(30, 136, 235);
 const COLORREF accentLo = RGB(0, 90, 172);
+const COLORREF section = RGB(86, 160, 245);
 const COLORREF sel = RGB(26, 44, 74);
 const COLORREF ok = RGB(52, 199, 120);
 const COLORREF okBg = RGB(20, 52, 38);
 const COLORREF bad = RGB(240, 82, 87);
 const COLORREF badBg = RGB(66, 25, 29);
 const COLORREF warn = RGB(245, 170, 50);
+const COLORREF closeHot = RGB(196, 43, 28);
 }
 
-enum BtnKind { BK_PRIMARY, BK_GHOST, BK_DANGER, BK_ICON, BK_DROP };
+enum { IDC_SELECT = 200, IDC_LOGBTN, IDC_MIN, IDC_MAX, IDC_CLOSE, IDC_FILE, IDC_SCROLL, IDC_DEV };
+enum BtnKind { BK_PRIMARY, BK_GHOST, BK_DANGER, BK_ICON, BK_FIELD, BK_CAP, BK_CAPCLOSE };
 struct BtnInfo {
     int kind = BK_GHOST;
     wchar_t icon = 0;
     bool hot = false;
+    bool active = false;
+};
+
+struct Label {
+    RECT r;
+    std::wstring text;
+    bool section;
 };
 
 struct Ui {
-    HWND drives, refresh, driveinfo, version, archives, site, cache, source, sha, drop, progress, status, detail;
-    HWND start, cancel, format, eject, log, tip, scroll;
-    HFONT font = nullptr, semi = nullptr, title = nullptr, small = nullptr, mono = nullptr, icon = nullptr, iconBig = nullptr;
-    HBRUSH bgBrush = nullptr, cardBrush = nullptr, fieldBrush = nullptr;
+    HWND drives, refresh, driveinfo, version, archives, site, cache, sha, file, select, progress, detail;
+    HWND start, cancel, format, eject, logbtn, devbtn, log, scroll, tip, bmin, bmax, bclose;
+    HFONT font = nullptr, semi = nullptr, title = nullptr, small = nullptr, smallSemi = nullptr, mono = nullptr, icon = nullptr, iconCap = nullptr;
+    HBRUSH bgBrush = nullptr, fieldBrush = nullptr;
     HICON appIcon = nullptr;
     std::wstring uiFont = L"Segoe UI", iconFont = L"Segoe MDL2 Assets", monoFont = L"Consolas";
-    RECT cards[4]{}, logField{};
+    std::vector<Label> labels;
+    RECT shaField{}, logField{};
+    int captionH = 0, footerTop = 0, contentH = 0;
     UINT dpi = 96;
     ITaskbarList3* tb = nullptr;
     UINT tbmsg = 0;
+    std::wstring status = L"Prêt";
     COLORREF status_color = C::text;
     COLORREF bar_color = C::accent;
     int bar_pos = 0;
@@ -1296,9 +1312,12 @@ struct Ui {
     int close_ticks = 0;
     bool pending_scan = false;
     bool has_mega = false;
+    bool log_visible = false;
+    bool win11 = false;
 } ui;
 
 enum { TIMER_ANIM = 3 };
+static const int LOG_H = 170;
 
 static std::map<HWND, BtnInfo> g_btn;
 static Catalog g_catalog;
@@ -1307,17 +1326,18 @@ static std::vector<Drive> g_drives;
 static std::wstring g_local_path, g_local_version;
 static std::wstring g_selected_version = L"13.60.00";
 static std::wstring g_selected_drive_id;
-static std::wstring g_drop_main, g_drop_sub;
-static bool g_drop_ok = false;
-
-static const wchar_t* DROP_MAIN = L"Glisse un fichier .PUP ici";
-static const wchar_t* DROP_SUB = L"ou clique pour parcourir · version identifiée par SHA-256";
+static std::wstring g_file_text;
+static bool g_file_ok = false;
 
 static int S(int v) { return MulDiv(v, (int)ui.dpi, 96); }
 static Gdiplus::Color GC(COLORREF c, BYTE a = 255) { return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c)); }
 
 static void round_path(Gdiplus::GraphicsPath& p, float x, float y, float w, float h, float r) {
     float d = std::min(r * 2, std::min(w, h));
+    if (d <= 0) {
+        p.AddRectangle(Gdiplus::RectF(x, y, w, h));
+        return;
+    }
     p.AddArc(x, y, d, d, 180, 90);
     p.AddArc(x + w - d, y, d, d, 270, 90);
     p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
@@ -1325,35 +1345,23 @@ static void round_path(Gdiplus::GraphicsPath& p, float x, float y, float w, floa
     p.CloseFigure();
 }
 
-static void rrect(HDC dc, const RECT& r, int rad, COLORREF fill, COLORREF stroke, bool dashed = false) {
+static void rrect(HDC dc, const RECT& r, int rad, COLORREF fillc, COLORREF stroke) {
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
     float x = (float)r.left, y = (float)r.top, w = (float)(r.right - r.left), h = (float)(r.bottom - r.top);
-    if (fill != CLR_NONE) {
+    if (fillc != CLR_NONE) {
         Gdiplus::GraphicsPath p;
         round_path(p, x, y, w, h, (float)rad);
-        Gdiplus::SolidBrush b(GC(fill));
+        Gdiplus::SolidBrush b(GC(fillc));
         g.FillPath(&b, &p);
     }
     if (stroke != CLR_NONE) {
         Gdiplus::GraphicsPath p;
         round_path(p, x + 0.5f, y + 0.5f, w - 1, h - 1, (float)rad);
         Gdiplus::Pen pen(GC(stroke), 1.0f);
-        if (dashed) {
-            Gdiplus::REAL pat[] = {4.0f, 3.0f};
-            pen.SetDashPattern(pat, 2);
-        }
         g.DrawPath(&pen, &p);
     }
-}
-
-static void circle(HDC dc, int cx, int cy, int r, COLORREF fill) {
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-    Gdiplus::SolidBrush b(GC(fill));
-    g.FillEllipse(&b, (float)(cx - r), (float)(cy - r), (float)(2 * r), (float)(2 * r));
 }
 
 static void draw_text(HDC dc, const std::wstring& s, RECT r, HFONT f, COLORREF c, UINT fmt) {
@@ -1376,14 +1384,14 @@ struct MemDC {
     HDC dst, dc;
     HBITMAP bmp;
     HGDIOBJ old;
-    int w, h;
-    MemDC(HDC d, int w_, int h_) : dst(d), w(w_), h(h_) {
+    int x, y, w, h;
+    MemDC(HDC d, int w_, int h_, int x_ = 0, int y_ = 0) : dst(d), x(x_), y(y_), w(w_), h(h_) {
         dc = CreateCompatibleDC(d);
         bmp = CreateCompatibleBitmap(d, std::max(1, w), std::max(1, h));
         old = SelectObject(dc, bmp);
     }
     ~MemDC() {
-        BitBlt(dst, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+        BitBlt(dst, x, y, w, h, dc, 0, 0, SRCCOPY);
         SelectObject(dc, old);
         DeleteObject(bmp);
         DeleteDC(dc);
@@ -1398,6 +1406,21 @@ static void fill(HDC dc, const RECT& r, COLORREF c) {
 
 static void set_text(HWND h, const std::wstring& s) { SetWindowTextW(h, s.c_str()); }
 
+static std::wstring g_log_mirror;
+static HWND g_dev_log = nullptr;
+
+static void append_edit(HWND e, const std::wstring& line) {
+    int len = GetWindowTextLengthW(e);
+    if (len > 1800000) {
+        SendMessageW(e, EM_SETSEL, 0, len / 2);
+        SendMessageW(e, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        len = GetWindowTextLengthW(e);
+    }
+    SendMessageW(e, EM_SETSEL, len, len);
+    SendMessageW(e, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+    SendMessageW(e, EM_SCROLLCARET, 0, 0);
+}
+
 static void log_line(const std::wstring& s) {
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -1408,19 +1431,19 @@ static void log_line(const std::wstring& s) {
         else p++;
     }
     std::wstring line = F(L"%02d:%02d:%02d   ", t.wHour, t.wMinute, t.wSecond) + body + L"\r\n";
-    int len = GetWindowTextLengthW(ui.log);
-    SendMessageW(ui.log, EM_SETSEL, len, len);
-    SendMessageW(ui.log, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
-    SendMessageW(ui.log, EM_SCROLLCARET, 0, 0);
-}
-
-static void set_status(const std::wstring& s, COLORREF c = C::text) {
-    ui.status_color = c;
-    set_text(ui.status, s);
-    InvalidateRect(ui.status, nullptr, TRUE);
+    g_log_mirror += line;
+    if (g_log_mirror.size() > 256 * 1024) g_log_mirror.erase(0, g_log_mirror.size() - 192 * 1024);
+    append_edit(ui.log, line);
+    if (g_dev_log) append_edit(g_dev_log, line);
 }
 
 static void redraw_bar() { InvalidateRect(ui.progress, nullptr, FALSE); }
+
+static void set_status(const std::wstring& s, COLORREF c = C::text) {
+    ui.status = s;
+    ui.status_color = c;
+    redraw_bar();
+}
 
 static void set_marquee(bool on) {
     if (on == ui.marquee) return;
@@ -1480,47 +1503,36 @@ static std::wstring source_tag(const Firmware& f) {
     return L"fichier local";
 }
 
-static bool step1_ready() {
-    const Drive* d = selected_drive();
-    return d && d->fs_ok();
-}
-
-static bool step2_ready() {
-    const Firmware* f = selected_fw();
-    if (!f || !is_hex(f->sha256, 64)) return false;
-    return (!g_local_path.empty() && g_local_version == f->version) || !f->direct.empty() || mega_auto(*f) || in_cache(*f);
-}
-
-static void refresh_steps() {
-    for (int i = 0; i < 2; i++) InvalidateRect(g_hwnd, &ui.cards[i], FALSE);
+static void redraw_footer() {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    RECT f{0, ui.footerTop, rc.right, rc.bottom};
+    InvalidateRect(g_hwnd, &f, FALSE);
 }
 
 static void update_drive_info() {
     InvalidateRect(ui.driveinfo, nullptr, FALSE);
-    refresh_steps();
-}
-
-static void reset_drop() {
-    g_drop_main = DROP_MAIN;
-    g_drop_sub = DROP_SUB;
-    g_drop_ok = false;
-    g_btn[ui.drop].icon = 0xE896;
-    InvalidateRect(ui.drop, nullptr, FALSE);
+    redraw_footer();
 }
 
 static void update_fw_info() {
     const Firmware* f = selected_fw();
     if (!f) return;
-    std::wstring src;
-    if (!g_local_path.empty() && g_local_version == f->version) src = L"Source : fichier local identifié";
-    else if (in_cache(*f)) src = L"Source : déjà téléchargé (cache local)";
-    else if (!f->direct.empty()) src = L"Source : téléchargement HTTPS direct, reprise automatique";
-    else if (!f->mega.empty()) src = mega_auto(*f) ? L"Source : MEGA automatique via MEGAcmd" : L"Source : MEGA — télécharge-le puis glisse le .PUP ci-dessous";
-    else src = L"Source : aucun lien — glisse le .PUP ci-dessous";
-    if (f->size) src += L"   ·   " + human(f->size);
-    set_text(ui.source, src);
-    set_text(ui.sha, L"SHA-256  " + (is_hex(f->sha256, 64) ? W(f->sha256) : std::wstring(L"inconnu — copie bloquée")));
-    refresh_steps();
+    if (!g_local_path.empty() && g_local_version == f->version) {
+        g_file_ok = true;
+        g_btn[ui.file].icon = 0xE73E;
+        g_file_text = g_local_path.substr(g_local_path.find_last_of(L"\\/") + 1) + L"   ·   identifié, SHA-256 conforme";
+    } else {
+        g_file_ok = false;
+        g_btn[ui.file].icon = 0xE896;
+        if (in_cache(*f)) g_file_text = L"Déjà téléchargé (cache local)";
+        else if (!f->direct.empty()) g_file_text = L"Téléchargement automatique (HTTPS)";
+        else if (!f->mega.empty()) g_file_text = mega_auto(*f) ? L"Téléchargement automatique (MEGAcmd)" : L"Sur MEGA : télécharge-le puis sélectionne-le";
+        else g_file_text = L"Aucun lien : sélectionne ou glisse un .PUP";
+        if (f->size) g_file_text += L"   ·   " + human(f->size);
+    }
+    InvalidateRect(ui.file, nullptr, FALSE);
+    set_text(ui.sha, is_hex(f->sha256, 64) ? W(f->sha256) : std::wstring(L"inconnu — copie bloquée"));
 }
 
 static void fill_versions() {
@@ -1540,6 +1552,7 @@ static void fill_versions() {
     SendMessageW(ui.version, CB_SETCURSEL, sel, 0);
     if (sel >= 0) g_selected_version = g_versions[sel];
     update_fw_info();
+    redraw_footer();
 }
 
 static void fill_drives() {
@@ -1564,7 +1577,7 @@ static void fill_drives() {
 static void apply_busy() {
     bool b = g_busy;
     bool has = selected_drive() != nullptr;
-    for (HWND h : {ui.drives, ui.version, ui.drop, ui.cache}) EnableWindow(h, !b);
+    for (HWND h : {ui.drives, ui.version, ui.file, ui.select, ui.cache}) EnableWindow(h, !b);
     EnableWindow(ui.refresh, !b && !g_scanning);
     EnableWindow(ui.archives, !b && !g_catalog_loading);
     EnableWindow(ui.start, !b && has);
@@ -1572,7 +1585,8 @@ static void apply_busy() {
     EnableWindow(ui.eject, !b && has);
     EnableWindow(ui.cancel, b);
     DragAcceptFiles(g_hwnd, !b);
-    set_text(ui.start, b ? L"En cours…" : L"Préparer la clé");
+    set_text(ui.start, b ? L"En cours…" : L"Préparer");
+    InvalidateRect(ui.start, nullptr, FALSE);
 }
 
 static void scan_drives() {
@@ -1662,18 +1676,13 @@ static void on_ident(IdentInfo* info) {
             g_local_version = kv.first;
             g_selected_version = kv.first;
             fill_versions();
-            g_drop_main = info->path.substr(info->path.find_last_of(L"\\/") + 1);
-            g_drop_sub = L"Firmware " + kv.first + L" identifié · SHA-256 conforme · " + human(info->size);
-            g_drop_ok = true;
-            g_btn[ui.drop].icon = 0xE73E;
-            InvalidateRect(ui.drop, nullptr, FALSE);
             log_line(L"PUP local identifié : firmware " + kv.first);
             return;
         }
     }
     g_local_path.clear();
     g_local_version.clear();
-    reset_drop();
+    update_fw_info();
     log_line(L"PUP inconnu, SHA-256 : " + W(info->sha));
     ask(L"Ce PUP ne correspond à aucune référence SHA-256 connue.\n\nC'est peut-être un PUP Recovery, un fichier modifié ou une version absente du catalogue (actualise les archives, ou ajoute son hash dans sha256_references.json à côté de l'exe).\n\nSHA-256 : " +
             W(info->sha),
@@ -1705,24 +1714,25 @@ static void start_prepare() {
     if (!d.fs_ok()) {
         if (ask(L"La clé " + std::wstring(1, d.letter) + L": est en " + d.fs + L", que la PS5 ne lit pas.\n\nLa formater en exFAT maintenant ?\nTOUTES ses données seront effacées.", APP_NAME,
                 MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES)
-            run_job(JOB_FORMAT, [d]() { format_drive(d); return std::wstring(L"Clé formatée en exFAT. Relance « Préparer la clé »."); });
+            run_job(JOB_FORMAT, [d]() { format_drive(d); return std::wstring(L"Clé formatée en exFAT. Relance « Préparer »."); });
         return;
     }
     bool use_local = !g_local_path.empty() && g_local_version == fw.version;
     if (use_local && !file_exists(g_local_path)) {
         ask(L"Le fichier local n'existe plus.", APP_NAME, MB_ICONERROR);
         g_local_path.clear();
-        reset_drop();
+        g_local_version.clear();
+        update_fw_info();
         return;
     }
     std::wstring cached = cache_path(fw);
     bool have_cache = in_cache(fw);
     if (!use_local && !have_cache && fw.direct.empty() && !mega_auto(fw)) {
         if (!fw.mega.empty()) {
-            if (ask(L"Cette version n'est disponible que sur MEGA.\n\nOuvrir le lien dans le navigateur ? Une fois téléchargé, glisse le .PUP dans la fenêtre.\n(Ou installe MEGAcmd pour le téléchargement automatique.)", APP_NAME,
+            if (ask(L"Cette version n'est disponible que sur MEGA.\n\nOuvrir le lien dans le navigateur ? Une fois téléchargé, sélectionne ou glisse le .PUP dans la fenêtre.\n(Ou installe MEGAcmd pour le téléchargement automatique.)", APP_NAME,
                     MB_ICONINFORMATION | MB_YESNO) == IDYES)
                 ShellExecuteW(g_hwnd, L"open", fw.mega.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        } else ask(L"Aucun lien pour cette version. Télécharge le PUP puis glisse-le dans la fenêtre.", APP_NAME, MB_ICONINFORMATION);
+        } else ask(L"Aucun lien pour cette version. Télécharge le PUP puis sélectionne-le.", APP_NAME, MB_ICONINFORMATION);
         return;
     }
     uint64_t need = use_local ? file_size(g_local_path) : (have_cache ? file_size(cached) : fw.size);
@@ -1787,76 +1797,117 @@ static HFONT mkfont(const std::wstring& face, double pt, int weight) {
 }
 
 static void make_fonts() {
-    for (HFONT f : {ui.font, ui.semi, ui.title, ui.small, ui.mono, ui.icon, ui.iconBig})
+    for (HFONT f : {ui.font, ui.semi, ui.title, ui.small, ui.smallSemi, ui.mono, ui.icon, ui.iconCap})
         if (f) DeleteObject(f);
     ui.font = mkfont(ui.uiFont, 9, FW_NORMAL);
     ui.semi = mkfont(ui.uiFont, 9, FW_SEMIBOLD);
-    ui.title = mkfont(ui.uiFont, 14, FW_SEMIBOLD);
+    ui.title = mkfont(ui.uiFont, 10, FW_SEMIBOLD);
     ui.small = mkfont(ui.uiFont, 8, FW_NORMAL);
+    ui.smallSemi = mkfont(ui.uiFont, 8, FW_BOLD);
     ui.mono = mkfont(ui.monoFont, 8, FW_NORMAL);
     ui.icon = mkfont(ui.iconFont, 9, FW_NORMAL);
-    ui.iconBig = mkfont(ui.iconFont, 15, FW_NORMAL);
+    ui.iconCap = mkfont(ui.iconFont, 7, FW_NORMAL);
     EnumChildWindows(g_hwnd, [](HWND c, LPARAM) -> BOOL { SendMessageW(c, WM_SETFONT, (WPARAM)ui.font, TRUE); return TRUE; }, 0);
     SendMessageW(ui.sha, WM_SETFONT, (WPARAM)ui.mono, TRUE);
     SendMessageW(ui.log, WM_SETFONT, (WPARAM)ui.mono, TRUE);
-    SendMessageW(ui.status, WM_SETFONT, (WPARAM)ui.semi, TRUE);
     SendMessageW(ui.detail, WM_SETFONT, (WPARAM)ui.small, TRUE);
-    SendMessageW(ui.source, WM_SETFONT, (WPARAM)ui.small, TRUE);
     for (HWND cb : {ui.drives, ui.version}) {
         SendMessageW(cb, CB_SETITEMHEIGHT, (WPARAM)-1, S(26));
         SendMessageW(cb, CB_SETITEMHEIGHT, 0, S(28));
     }
     if (ui.appIcon) DestroyIcon(ui.appIcon);
-    ui.appIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, S(30), S(30), 0);
+    ui.appIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, S(20), S(20), 0);
 }
 
 static bool sb_update();
 
+static int content_height(bool with_log) {
+    int h = S(42) + S(10);
+    h += S(30) + S(18) + S(32) + S(10) + S(18) + S(30) + S(14);
+    h += S(30) + S(18) + S(32) + S(10) + S(18) + S(30) + S(10) + S(18) + S(28) + S(14);
+    h += S(30) + S(30) + S(22) + S(10);
+    h += S(34) + S(14);
+    if (with_log) h += S(LOG_H);
+    h += S(28);
+    return h;
+}
+
 static void layout() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    int m = S(16), cw = rc.right - 2 * m, pad = S(16), y = S(66);
-    auto place = [](HWND h, int x, int y2, int w, int hh) { MoveWindow(h, x, y2, w, hh, FALSE); };
-    int bh = S(28);
+    int W = rc.right, m = S(18), cw = W - 2 * m, x = m;
+    ui.captionH = S(42);
+    ui.labels.clear();
+    auto place = [](HWND h, int px, int py, int w, int hh) { MoveWindow(h, px, py, w, hh, FALSE); };
+    int capw = S(46), caph = S(32);
+    place(ui.bclose, W - capw, 0, capw, caph);
+    place(ui.bmax, W - 2 * capw, 0, capw, caph);
+    place(ui.bmin, W - 3 * capw, 0, capw, caph);
+    int y = ui.captionH + S(10);
+    auto section = [&](const wchar_t* t) {
+        ui.labels.push_back({{x, y, x + cw, y + S(22)}, t, true});
+        y += S(30);
+    };
+    auto label = [&](const wchar_t* t, int lx, int lw) { ui.labels.push_back({{lx, y, lx + lw, y + S(16)}, t, false}); };
+    int fh = S(30), gap = S(8);
 
-    RECT& c0 = ui.cards[0];
-    c0 = {m, y, m + cw, y + S(118)};
-    int x = c0.left + pad, iw = cw - 2 * pad;
-    place(ui.eject, c0.right - pad - S(86), c0.top + S(12), S(86), bh);
-    place(ui.format, c0.right - pad - S(86) - S(6) - S(100), c0.top + S(12), S(100), bh);
-    place(ui.drives, x, c0.top + S(50), iw - S(40), S(300));
-    place(ui.refresh, c0.right - pad - S(34), c0.top + S(50), S(34), S(30));
-    place(ui.driveinfo, x, c0.top + S(88), iw, S(20));
-    y = c0.bottom + S(12);
+    section(L"Périphérique");
+    label(L"Clé USB", x, cw);
+    y += S(18);
+    place(ui.drives, x, y, cw - S(30) - gap, S(300));
+    place(ui.refresh, x + cw - S(30), y, S(30), fh);
+    y += S(32) + S(10);
+    label(L"Système de fichiers", x, cw / 2);
+    label(L"Espace libre", x + cw / 2 + gap / 2, cw / 2);
+    y += S(18);
+    place(ui.driveinfo, x, y, cw, fh);
+    y += S(30) + S(14);
 
-    RECT& c1 = ui.cards[1];
-    c1 = {m, y, m + cw, y + S(196)};
-    place(ui.cache, c1.right - pad - S(34), c1.top + S(12), S(34), bh);
-    place(ui.site, c1.right - pad - S(34) * 2 - S(6), c1.top + S(12), S(34), bh);
-    place(ui.archives, c1.right - pad - S(34) * 3 - S(12), c1.top + S(12), S(34), bh);
-    place(ui.version, x, c1.top + S(50), iw, S(300));
-    place(ui.source, x, c1.top + S(88), iw, S(18));
-    place(ui.sha, x, c1.top + S(107), iw, S(16));
-    place(ui.drop, x, c1.top + S(132), iw, S(50));
-    y = c1.bottom + S(12);
+    section(L"Firmware");
+    label(L"Version", x, cw);
+    y += S(18);
+    place(ui.version, x, y, cw - 2 * S(30) - 2 * gap, S(300));
+    place(ui.archives, x + cw - 2 * S(30) - gap, y, S(30), fh);
+    place(ui.site, x + cw - S(30), y, S(30), fh);
+    y += S(32) + S(10);
+    label(L"Fichier PUP", x, cw);
+    y += S(18);
+    place(ui.file, x, y, cw - S(100) - gap, fh);
+    place(ui.select, x + cw - S(100), y, S(100), fh);
+    y += S(30) + S(10);
+    label(L"Empreinte SHA-256", x, cw);
+    y += S(18);
+    ui.shaField = {x, y, x + cw, y + S(28)};
+    place(ui.sha, x + S(10), y + S(7), cw - S(20), S(16));
+    y += S(28) + S(14);
 
-    RECT& c2 = ui.cards[2];
-    c2 = {m, y, m + cw, y + S(140)};
-    place(ui.status, x, c2.top + S(48), iw * 55 / 100, S(20));
-    place(ui.detail, x + iw * 55 / 100, c2.top + S(50), iw - iw * 55 / 100, S(18));
-    place(ui.progress, x, c2.top + S(74), iw, S(8));
-    place(ui.start, x, c2.top + S(94), iw - S(110), S(34));
-    place(ui.cancel, c2.right - pad - S(102), c2.top + S(94), S(102), S(34));
-    y = c2.bottom + S(12);
+    section(L"Statut");
+    place(ui.progress, x, y, cw, S(30));
+    y += S(30) + S(4);
+    place(ui.detail, x, y, cw, S(18));
+    y += S(18) + S(10);
 
-    RECT& c3 = ui.cards[3];
-    c3 = {m, y, m + cw, std::max(y + S(110), (int)rc.bottom - m)};
-    ui.logField = {x - S(4), c3.top + S(44), c3.right - pad + S(4), c3.bottom - S(12)};
-    int lw = ui.logField.right - ui.logField.left, lh = ui.logField.bottom - ui.logField.top;
-    place(ui.log, ui.logField.left + S(8), ui.logField.top + S(6), lw - S(8) - S(16), lh - S(10));
-    place(ui.scroll, ui.logField.right - S(14), ui.logField.top + S(4), S(12), lh - S(8));
-    InvalidateRect(g_hwnd, nullptr, TRUE);
-    RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE);
+    int bh = S(34), ib = S(34);
+    place(ui.logbtn, x, y, ib, bh);
+    place(ui.cache, x + (ib + S(6)), y, ib, bh);
+    place(ui.format, x + 2 * (ib + S(6)), y, ib, bh);
+    place(ui.eject, x + 3 * (ib + S(6)), y, ib, bh);
+    place(ui.devbtn, x + 4 * (ib + S(6)), y, ib, bh);
+    place(ui.cancel, x + cw - S(96), y, S(96), bh);
+    place(ui.start, x + cw - S(96) - gap - S(124), y, S(124), bh);
+    y += bh + S(14);
+
+    ui.footerTop = rc.bottom - S(28);
+    if (ui.log_visible) {
+        ui.logField = {x, y, x + cw, std::max(y + S(80), ui.footerTop - S(10))};
+        int lw = ui.logField.right - ui.logField.left, lh = ui.logField.bottom - ui.logField.top;
+        place(ui.log, ui.logField.left + S(10), ui.logField.top + S(8), lw - S(10) - S(18), lh - S(14));
+        place(ui.scroll, ui.logField.right - S(14), ui.logField.top + S(4), S(12), lh - S(8));
+    }
+    ShowWindow(ui.log, ui.log_visible ? SW_SHOW : SW_HIDE);
+    ShowWindow(ui.scroll, ui.log_visible ? SW_SHOW : SW_HIDE);
+    g_btn[ui.logbtn].active = ui.log_visible;
+    RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
     if (ui.scroll) sb_update();
 }
 
@@ -1866,37 +1917,35 @@ static void paint(HDC hdc) {
     MemDC mem(hdc, rc.right, rc.bottom);
     HDC dc = mem.dc;
     fill(dc, rc, C::bg);
-    int m = S(16);
-    if (ui.appIcon) DrawIconEx(dc, m, S(18), ui.appIcon, S(30), S(30), 0, nullptr, DI_NORMAL);
-    draw_text(dc, L"PSD", {m + S(42), S(14), rc.right, S(36)}, ui.title, C::text, DT_LEFT | DT_SINGLELINE);
-    draw_text(dc, L"PS5 USB Prep · clé de mise à jour officielle, vérifiée bout à bout", {m + S(42), S(36), rc.right, S(54)}, ui.small, C::dim, DT_LEFT | DT_SINGLELINE);
-    std::wstring ver = std::wstring(L"v") + APP_VER;
-    int vw = text_width(dc, ver, ui.small) + S(16);
-    RECT pill{rc.right - m - vw, S(22), rc.right - m, S(42)};
-    rrect(dc, pill, S(10), C::card, C::border);
-    draw_text(dc, ver, pill, ui.small, C::dim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    fill(dc, {0, 0, rc.right, ui.captionH}, C::caption);
+    fill(dc, {0, ui.captionH - 1, rc.right, ui.captionH}, C::border);
+    int m = S(14);
+    if (ui.appIcon) DrawIconEx(dc, m, (ui.captionH - S(20)) / 2, ui.appIcon, S(20), S(20), 0, nullptr, DI_NORMAL);
+    int tx = m + S(30);
+    draw_text(dc, L"PSD", {tx, 0, rc.right, ui.captionH}, ui.title, C::text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    tx += text_width(dc, L"PSD", ui.title) + S(10);
+    draw_text(dc, L"PS5 USB Prep", {tx, 0, rc.right - S(150), ui.captionH}, ui.small, C::faint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    const wchar_t* titles[] = {L"Clé USB", L"Firmware", L"Préparation", L"Journal"};
-    bool ready[] = {step1_ready(), step2_ready(), false, false};
-    for (int i = 0; i < 4; i++) {
-        RECT c = ui.cards[i];
-        rrect(dc, c, S(12), C::card, C::border);
-        int tx = c.left + S(16), cy = c.top + S(26);
-        if (i < 3) {
-            int r = S(11);
-            circle(dc, tx + r, cy, r, ready[i] ? C::okBg : RGB(30, 40, 58));
-            RECT cr{tx, cy - r, tx + 2 * r, cy + r};
-            if (ready[i]) draw_text(dc, L"\xE73E", cr, ui.icon, C::ok, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            else draw_text(dc, std::to_wstring(i + 1), cr, ui.semi, C::accentHi, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            tx += 2 * r + S(10);
-        } else {
-            RECT ir{tx, cy - S(10), tx + S(20), cy + S(10)};
-            draw_text(dc, L"\xE81C", ir, ui.icon, C::faint, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            tx += S(28);
-        }
-        draw_text(dc, titles[i], {tx, cy - S(12), c.right - S(140), cy + S(12)}, ui.semi, C::text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    for (auto& l : ui.labels) {
+        if (l.section) {
+            int w = text_width(dc, l.text, ui.semi);
+            draw_text(dc, l.text, l.r, ui.semi, C::text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            int ly = (l.r.top + l.r.bottom) / 2;
+            Gdiplus::Graphics g(dc);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::LinearGradientBrush lb(Gdiplus::PointF((float)l.r.left + w + S(10), 0), Gdiplus::PointF((float)l.r.right + 1, 0), GC(C::accent), GC(C::bg));
+            g.FillRectangle(&lb, (float)l.r.left + w + S(10), (float)ly, (float)(l.r.right - l.r.left - w - S(10)), 1.0f);
+        } else draw_text(dc, l.text, l.r, ui.small, C::dim, DT_LEFT | DT_TOP | DT_SINGLELINE);
     }
-    rrect(dc, ui.logField, S(8), C::field, C::fieldBorder);
+    rrect(dc, ui.shaField, S(6), C::field, C::fieldBorder);
+    if (ui.log_visible) rrect(dc, ui.logField, S(8), C::field, C::fieldBorder);
+
+    fill(dc, {0, ui.footerTop, rc.right, rc.bottom}, C::caption);
+    fill(dc, {0, ui.footerTop, rc.right, ui.footerTop + 1}, C::border);
+    std::wstring foot = F(L"%d clé(s) USB détectée(s)   ·   %d firmware(s) au catalogue", (int)g_drives.size(), (int)g_catalog.size());
+    draw_text(dc, foot, {S(18), ui.footerTop, rc.right - S(80), rc.bottom}, ui.small, C::faint, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    draw_text(dc, std::wstring(L"v") + APP_VER, {0, ui.footerTop, rc.right - S(18), rc.bottom}, ui.small, C::faint, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    if (!ui.win11 && !IsZoomed(g_hwnd)) rrect(dc, {0, 0, rc.right, rc.bottom}, S(8), CLR_NONE, C::border);
 }
 
 static void draw_button(DRAWITEMSTRUCT* di) {
@@ -1906,48 +1955,56 @@ static void draw_button(DRAWITEMSTRUCT* di) {
     MemDC mem(di->hDC, w, h);
     HDC dc = mem.dc;
     RECT full{0, 0, w, h};
-    fill(dc, full, C::card);
+    bool cap = b.kind == BK_CAP || b.kind == BK_CAPCLOSE;
+    fill(dc, full, cap ? C::caption : C::bg);
     bool dis = di->itemState & ODS_DISABLED, down = di->itemState & ODS_SELECTED;
     bool focus = (di->itemState & ODS_FOCUS) && !(di->itemState & ODS_NOFOCUSRECT);
     bool hot = b.hot && !dis;
-    COLORREF bg, br, fg;
+    if (cap) {
+        bool closeHot = b.kind == BK_CAPCLOSE && (hot || down);
+        if (closeHot) fill(dc, full, down ? RGB(150, 32, 22) : C::closeHot);
+        else if (hot || down) fill(dc, full, down ? C::press : C::hover);
+        wchar_t g = b.icon;
+        if (di->hwndItem == ui.bmax) g = IsZoomed(g_hwnd) ? 0xE923 : 0xE922;
+        draw_text(dc, std::wstring(1, g), full, ui.iconCap, closeHot ? RGB(255, 255, 255) : C::text, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return;
+    }
+    COLORREF bgc, br, fg;
     switch (b.kind) {
     case BK_PRIMARY:
-        bg = dis ? RGB(34, 39, 50) : down ? C::accentLo : hot ? C::accentHi : C::accent;
+        bgc = dis ? RGB(34, 39, 50) : down ? C::accentLo : hot ? C::accentHi : C::accent;
         br = CLR_NONE;
         fg = dis ? C::faint : RGB(255, 255, 255);
         break;
-    case BK_DROP:
-        bg = dis ? C::field : hot ? RGB(18, 26, 40) : C::field;
-        br = g_drop_ok ? C::ok : hot ? C::accentHi : C::fieldBorder;
+    case BK_FIELD:
+        bgc = dis ? C::bg : hot ? RGB(28, 32, 42) : C::field;
+        br = g_file_ok ? RGB(36, 110, 76) : hot ? RGB(68, 74, 90) : C::fieldBorder;
         fg = C::text;
         break;
     default:
-        bg = dis ? C::card : down ? C::press : hot ? C::hover : C::card;
-        br = dis ? C::border : hot ? RGB(68, 74, 90) : C::fieldBorder;
-        fg = dis ? C::faint : (b.kind == BK_DANGER && hot) ? C::bad : C::text;
+        bgc = b.active ? C::sel : dis ? C::bg : down ? C::press : hot ? C::hover : C::field;
+        br = b.active ? C::accent : dis ? C::border : hot ? RGB(68, 74, 90) : C::fieldBorder;
+        fg = dis ? C::faint : (b.kind == BK_DANGER && hot) ? C::bad : b.active ? C::accentHi : C::text;
         break;
     }
-    rrect(dc, full, S(b.kind == BK_PRIMARY ? 8 : 7), bg, br, b.kind == BK_DROP && !g_drop_ok);
+    rrect(dc, full, S(6), bgc, br);
     if (focus) {
         RECT fr{1, 1, w - 1, h - 1};
-        rrect(dc, fr, S(7), CLR_NONE, b.kind == BK_PRIMARY ? RGB(140, 190, 255) : C::accentHi);
+        rrect(dc, fr, S(6), CLR_NONE, b.kind == BK_PRIMARY ? RGB(140, 190, 255) : C::accentHi);
     }
-    if (b.kind == BK_DROP) {
-        COLORREF ic = g_drop_ok ? C::ok : hot ? C::accentHi : C::dim;
-        RECT ir{S(12), 0, S(44), h};
-        draw_text(dc, std::wstring(1, b.icon), ir, ui.iconBig, ic, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        draw_text(dc, g_drop_main, {S(52), S(8), w - S(12), h / 2 + S(1)}, ui.semi, dis ? C::faint : C::text, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-        draw_text(dc, g_drop_sub, {S(52), h / 2 + S(1), w - S(12), h - S(6)}, ui.small, g_drop_ok ? C::ok : C::dim, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (b.kind == BK_FIELD) {
+        COLORREF ic = g_file_ok ? C::ok : C::dim;
+        draw_text(dc, std::wstring(1, b.icon), {S(8), 0, S(30), h}, ui.icon, dis ? C::faint : ic, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        draw_text(dc, g_file_text, {S(34), 0, w - S(10), h}, ui.font, dis ? C::faint : (g_file_ok ? C::ok : C::text), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         return;
     }
     wchar_t label[128]{};
     GetWindowTextW(di->hwndItem, label, 128);
-    HFONT tf = b.kind == BK_PRIMARY ? ui.semi : ui.font;
-    if (b.kind == BK_ICON) {
+    if (b.kind == BK_ICON || !label[0]) {
         draw_text(dc, std::wstring(1, b.icon), full, ui.icon, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         return;
     }
+    HFONT tf = b.kind == BK_PRIMARY ? ui.semi : ui.font;
     int tw = text_width(dc, label, tf), iw = b.icon ? S(16) + S(8) : 0;
     int x0 = (w - tw - iw) / 2;
     if (b.icon) draw_text(dc, std::wstring(1, b.icon), {x0, 0, x0 + S(16), h}, ui.icon, fg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1974,7 +2031,7 @@ static void draw_combo_content(HDC dc, RECT lr, HWND cb, int idx, bool sel, bool
             if (tag == L"sans SHA-256") tagc = C::bad;
             else if (tag == L"HTTPS" || tag == L"en cache" || tag == L"MEGAcmd") tagc = C::ok;
             else if (tag == L"MEGA manuel" || tag == L"fichier local") tagc = C::warn;
-            rrect(dc, pr, S(9), sel ? RGB(36, 56, 90) : RGB(28, 32, 42), CLR_NONE);
+            rrect(dc, pr, S(9), sel ? RGB(36, 56, 90) : RGB(32, 36, 47), CLR_NONE);
             draw_text(dc, tag, pr, ui.small, dis ? C::faint : tagc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else draw_text(dc, tag, pr, ui.small, C::dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
         tr.right = pr.left - S(6);
@@ -1986,16 +2043,10 @@ static void draw_combo_item(DRAWITEMSTRUCT* di) {
     RECT r = di->rcItem;
     bool sel = (di->itemState & ODS_SELECTED) && !(di->itemState & ODS_COMBOBOXEDIT);
     int w = r.right - r.left, h = r.bottom - r.top;
-    HDC mdc = CreateCompatibleDC(di->hDC);
-    HBITMAP bmp = CreateCompatibleBitmap(di->hDC, std::max(1, w), std::max(1, h));
-    HGDIOBJ old = SelectObject(mdc, bmp);
+    MemDC mem(di->hDC, w, h, r.left, r.top);
     RECT lr{0, 0, w, h};
-    fill(mdc, lr, sel ? C::sel : C::field);
-    draw_combo_content(mdc, lr, di->hwndItem, (int)di->itemID, sel, false);
-    BitBlt(di->hDC, r.left, r.top, w, h, mdc, 0, 0, SRCCOPY);
-    SelectObject(mdc, old);
-    DeleteObject(bmp);
-    DeleteDC(mdc);
+    fill(mem.dc, lr, sel ? C::sel : C::field);
+    draw_combo_content(mem.dc, lr, di->hwndItem, (int)di->itemID, sel, false);
 }
 
 static std::map<HWND, bool> g_combo_hot;
@@ -2010,14 +2061,14 @@ static LRESULT CALLBACK ComboProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR
         {
             MemDC mem(hdc, rc.right, rc.bottom);
             HDC dc = mem.dc;
-            fill(dc, rc, C::card);
+            fill(dc, rc, C::bg);
             bool dis = !IsWindowEnabled(h), open = SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0), focus = GetFocus() == h;
             bool hot = g_combo_hot[h] && !dis;
-            rrect(dc, rc, S(7), dis ? C::card : (hot || open) ? RGB(20, 23, 31) : C::field, (open || focus) ? C::accent : hot ? RGB(68, 74, 90) : C::fieldBorder);
+            rrect(dc, rc, S(6), dis ? C::bg : (hot || open) ? RGB(28, 32, 42) : C::field, (open || focus) ? C::accent : hot ? RGB(68, 74, 90) : C::fieldBorder);
             RECT content{rc.left + 1, rc.top + 1, rc.right - S(30), rc.bottom - 1};
             draw_combo_content(dc, content, h, (int)SendMessageW(h, CB_GETCURSEL, 0, 0), false, dis);
             RECT ar{rc.right - S(30), 0, rc.right - S(6), rc.bottom};
-            draw_text(dc, L"\xE70D", ar, ui.icon, dis ? C::faint : C::dim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            draw_text(dc, L"\xE70D", ar, ui.iconCap, dis ? C::faint : C::dim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         EndPaint(h, &ps);
         return 0;
@@ -2055,25 +2106,40 @@ static LRESULT CALLBACK ComboProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR
     return DefSubclassProc(h, m, wp, lp);
 }
 
+static void draw_field_box(HDC dc, RECT r, const std::wstring& txt, COLORREF col, const std::wstring& chip, bool chip_ok) {
+    rrect(dc, r, S(6), C::field, C::fieldBorder);
+    int x = r.left + S(10);
+    if (!chip.empty()) {
+        int cw = text_width(dc, chip, ui.smallSemi) + S(16);
+        int hh = r.bottom - r.top;
+        RECT c{x - S(4), r.top + (hh - S(18)) / 2, x - S(4) + cw, r.top + (hh - S(18)) / 2 + S(18)};
+        rrect(dc, c, S(9), chip_ok ? C::okBg : C::badBg, CLR_NONE);
+        draw_text(dc, chip, c, ui.smallSemi, chip_ok ? C::ok : C::bad, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        x = c.right + S(8);
+    }
+    draw_text(dc, txt, {x, r.top, r.right - S(8), r.bottom}, ui.font, col, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
 static void draw_driveinfo(DRAWITEMSTRUCT* di) {
     RECT r = di->rcItem;
-    int w = r.right - r.left, h = r.bottom - r.top;
+    int w = r.right - r.left, h = r.bottom - r.top, gap = S(8);
     MemDC mem(di->hDC, w, h);
     HDC dc = mem.dc;
-    fill(dc, {0, 0, w, h}, C::card);
+    fill(dc, {0, 0, w, h}, C::bg);
+    RECT a{0, 0, w / 2 - gap / 2, h}, b{w / 2 + gap / 2, 0, w, h};
     const Drive* d = selected_drive();
     if (!d) {
-        draw_text(dc, L"Branche une clé USB : elle sera détectée automatiquement.", {0, 0, w, h}, ui.small, C::dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        draw_field_box(dc, a, L"—", C::faint, L"", false);
+        draw_field_box(dc, b, L"—", C::faint, L"", false);
         return;
     }
     bool ok = d->fs_ok();
-    int cw = text_width(dc, d->fs, ui.small) + S(16);
-    RECT chip{0, (h - S(18)) / 2, cw, (h - S(18)) / 2 + S(18)};
-    rrect(dc, chip, S(9), ok ? C::okBg : C::badBg, CLR_NONE);
-    draw_text(dc, d->fs, chip, ui.small, ok ? C::ok : C::bad, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    std::wstring s = F(L"Disque %lu  ·  %ls  ·  %ls libres", d->disk, d->removable ? L"amovible" : L"externe", human(d->free).c_str());
-    if (!ok) s += L"  ·  à formater en exFAT";
-    draw_text(dc, s, {cw + S(10), 0, w, h}, ui.small, ok ? C::dim : C::warn, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    draw_field_box(dc, a, ok ? (d->removable ? L"amovible" : L"disque externe") : L"à formater en exFAT", ok ? C::dim : C::warn, d->fs, ok);
+    double pct = d->size ? 100.0 * (double)(d->size - std::min(d->size, d->free)) / (double)d->size : 0;
+    draw_field_box(dc, b, human(d->free) + L"  /  " + human(d->size), C::text, L"", false);
+    int bw = S(44), bx = b.right - S(10) - bw, by = (h - S(4)) / 2;
+    rrect(dc, {bx, by, bx + bw, by + S(4)}, S(2), RGB(40, 45, 57), CLR_NONE);
+    rrect(dc, {bx, by, bx + std::max(S(4), (int)(bw * pct / 100)), by + S(4)}, S(2), pct > 90 ? C::warn : C::accentHi, CLR_NONE);
 }
 
 static void draw_bar(DRAWITEMSTRUCT* di) {
@@ -2081,27 +2147,195 @@ static void draw_bar(DRAWITEMSTRUCT* di) {
     int w = r.right - r.left, h = r.bottom - r.top;
     MemDC mem(di->hDC, w, h);
     HDC dc = mem.dc;
-    fill(dc, {0, 0, w, h}, C::card);
-    rrect(dc, {0, 0, w, h}, h / 2, RGB(32, 36, 46), CLR_NONE);
+    fill(dc, {0, 0, w, h}, C::bg);
+    rrect(dc, {0, 0, w, h}, S(6), C::field, C::fieldBorder);
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    Gdiplus::GraphicsPath clip;
+    round_path(clip, 1, 1, (float)w - 2, (float)h - 2, (float)S(6) - 1);
+    g.SetClip(&clip);
     if (ui.marquee) {
-        int seg = w / 4, span = w + seg;
-        int x = (ui.phase * S(4)) % span - seg;
-        HRGN clip = CreateRectRgn(0, 0, w, h);
-        SelectClipRgn(dc, clip);
-        rrect(dc, {std::max(0, x), 0, std::min(w, x + seg), h}, h / 2, C::accentHi, CLR_NONE);
-        SelectClipRgn(dc, nullptr);
-        DeleteObject(clip);
+        int seg = w / 3, span = w + seg;
+        int x = (ui.phase * S(5)) % span - seg;
+        Gdiplus::LinearGradientBrush lb(Gdiplus::PointF((float)x, 0), Gdiplus::PointF((float)(x + seg), 0), GC(C::accent, 0), GC(C::accent, 200));
+        g.FillRectangle(&lb, (float)x, 0.0f, (float)seg, (float)h);
     } else if (ui.bar_pos > 0) {
-        int fw = std::max(h, w * ui.bar_pos / 1000);
-        Gdiplus::Graphics g(dc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-        Gdiplus::GraphicsPath p;
-        round_path(p, 0, 0, (float)fw, (float)h, h / 2.0f);
-        COLORREF a = ui.bar_color, b2 = ui.bar_color == C::accent ? C::accentHi : ui.bar_color;
-        Gdiplus::LinearGradientBrush lb(Gdiplus::PointF(0, 0), Gdiplus::PointF((float)fw + 1, 0), GC(a), GC(b2));
-        g.FillPath(&lb, &p);
+        float fw = (float)w * ui.bar_pos / 1000.0f;
+        COLORREF a = ui.bar_color == C::accent ? C::accentLo : ui.bar_color;
+        COLORREF b2 = ui.bar_color == C::accent ? C::accentHi : ui.bar_color;
+        BYTE alpha = ui.bar_color == C::accent ? 255 : 110;
+        Gdiplus::LinearGradientBrush lb(Gdiplus::PointF(0, 0), Gdiplus::PointF(fw + 1, 0), GC(a, alpha), GC(b2, alpha));
+        g.FillRectangle(&lb, 0.0f, 0.0f, fw, (float)h);
     }
+    g.ResetClip();
+    std::wstring t = ui.status;
+    if (g_busy && !ui.marquee && ui.bar_pos > 0 && ui.bar_pos < 1000) t += F(L"   %d %%", ui.bar_pos / 10);
+    draw_text(dc, t, {S(10), 0, w - S(10), h}, ui.semi, ui.status_color, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+struct ScrollState {
+    HWND edit = nullptr;
+    int total = 1, first = 0, visible = 1;
+    bool hot = false, drag = false;
+    int grab = 0;
+};
+static std::map<HWND, ScrollState> g_sbs;
+
+static int edit_line_height(HWND e) {
+    HDC dc = GetDC(e);
+    HGDIOBJ o = SelectObject(dc, (HFONT)SendMessageW(e, WM_GETFONT, 0, 0));
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, o);
+    ReleaseDC(e, dc);
+    return std::max(1, (int)tm.tmHeight);
+}
+
+static bool sb_update(HWND sb) {
+    auto it = g_sbs.find(sb);
+    if (it == g_sbs.end() || !it->second.edit) return false;
+    auto& st = it->second;
+    RECT r;
+    GetClientRect(st.edit, &r);
+    int total = std::max(1, (int)SendMessageW(st.edit, EM_GETLINECOUNT, 0, 0));
+    int first = (int)SendMessageW(st.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+    int visible = std::max(1, (int)(r.bottom - r.top) / edit_line_height(st.edit));
+    bool changed = total != st.total || first != st.first || visible != st.visible;
+    st.total = total;
+    st.first = first;
+    st.visible = visible;
+    if (changed) InvalidateRect(sb, nullptr, FALSE);
+    return changed;
+}
+
+static bool sb_update() { return ui.scroll ? sb_update(ui.scroll) : false; }
+
+static bool sb_thumb(HWND sb, RECT& t) {
+    auto& st = g_sbs[sb];
+    RECT r;
+    GetClientRect(sb, &r);
+    int h = r.bottom - r.top;
+    if (st.total <= st.visible || h <= 0) return false;
+    int th = std::max(S(28), h * st.visible / st.total);
+    int range = std::max(1, st.total - st.visible);
+    int y = (h - th) * std::min(st.first, range) / range;
+    t = {0, y, r.right, y + th};
+    return true;
+}
+
+static void sb_scroll_to(HWND sb, int line) {
+    auto& st = g_sbs[sb];
+    int range = std::max(0, st.total - st.visible);
+    line = std::max(0, std::min(range, line));
+    int first = (int)SendMessageW(st.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+    if (line != first) SendMessageW(st.edit, EM_LINESCROLL, 0, line - first);
+    sb_update(sb);
+}
+
+static LRESULT CALLBACK ScrollProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    auto& st = g_sbs[h];
+    switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        {
+            MemDC mem(hdc, rc.right, rc.bottom);
+            fill(mem.dc, rc, C::field);
+            RECT t;
+            if (sb_thumb(h, t)) {
+                bool big = st.hot || st.drag;
+                int w = big ? S(6) : S(4);
+                RECT p{rc.right - S(3) - w, t.top + S(2), rc.right - S(3), t.bottom - S(2)};
+                rrect(mem.dc, p, w / 2, st.drag ? RGB(120, 130, 150) : big ? RGB(92, 100, 118) : RGB(58, 64, 78), CLR_NONE);
+            }
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEMOVE: {
+        if (!st.hot) {
+            st.hot = true;
+            TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0};
+            TrackMouseEvent(&t);
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        if (st.drag) {
+            RECT rc, t;
+            GetClientRect(h, &rc);
+            if (sb_thumb(h, t)) {
+                int th = t.bottom - t.top, track = std::max(1, (int)rc.bottom - th);
+                int y = GET_Y_LPARAM(lp) - st.grab;
+                sb_scroll_to(h, (int)((long long)y * (st.total - st.visible) / track));
+            }
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        st.hot = false;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
+        RECT t;
+        if (!sb_thumb(h, t)) return 0;
+        int y = GET_Y_LPARAM(lp);
+        if (y >= t.top && y < t.bottom) {
+            st.drag = true;
+            st.grab = y - t.top;
+            SetCapture(h);
+        } else sb_scroll_to(h, st.first + (y < t.top ? -st.visible : st.visible));
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        if (st.drag) {
+            st.drag = false;
+            if (m == WM_LBUTTONUP) ReleaseCapture();
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        return st.edit ? SendMessageW(st.edit, m, wp, lp) : 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+static LRESULT CALLBACK LogProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+    LRESULT r = DefSubclassProc(h, m, wp, lp);
+    switch (m) {
+    case WM_MOUSEWHEEL: case WM_KEYDOWN: case WM_VSCROLL: case WM_SIZE: case WM_MOUSEMOVE: case WM_LBUTTONDOWN:
+    case EM_REPLACESEL: case EM_SCROLLCARET: case EM_LINESCROLL: case WM_SETTEXT: case WM_SETFONT: case EM_SETSEL:
+        sb_update((HWND)ref);
+        break;
+    }
+    return r;
+}
+
+static void register_scroll_class() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    WNDCLASSW sc{};
+    sc.lpfnWndProc = ScrollProc;
+    sc.hInstance = GetModuleHandleW(nullptr);
+    sc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    sc.style = CS_DBLCLKS;
+    sc.lpszClassName = L"PSDScrollBar";
+    RegisterClassW(&sc);
+}
+
+static HWND attach_scroll(HWND parent, HWND edit, int id) {
+    register_scroll_class();
+    HWND sb = CreateWindowExW(0, L"PSDScrollBar", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+    g_sbs[sb].edit = edit;
+    SetWindowSubclass(edit, LogProc, 3, (DWORD_PTR)sb);
+    return sb;
 }
 
 static LRESULT CALLBACK BtnProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
@@ -2121,7 +2355,7 @@ static LRESULT CALLBACK BtnProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, 
         InvalidateRect(h, nullptr, FALSE);
         break;
     case WM_SETCURSOR:
-        if (IsWindowEnabled(h)) {
+        if (IsWindowEnabled(h) && g_btn[h].kind != BK_CAP && g_btn[h].kind != BK_CAPCLOSE) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
@@ -2137,146 +2371,13 @@ static LRESULT CALLBACK BtnProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, 
     return DefSubclassProc(h, m, wp, lp);
 }
 
-struct ScrollState {
-    int total = 1, first = 0, visible = 1;
-    bool hot = false, drag = false;
-    int grab = 0;
-} g_sb;
-
-static int log_line_height() {
-    HDC dc = GetDC(ui.log);
-    HGDIOBJ o = SelectObject(dc, ui.mono);
-    TEXTMETRICW tm{};
-    GetTextMetricsW(dc, &tm);
-    SelectObject(dc, o);
-    ReleaseDC(ui.log, dc);
-    return std::max(1, (int)tm.tmHeight);
-}
-
-static bool sb_update() {
-    RECT r;
-    GetClientRect(ui.log, &r);
-    int total = std::max(1, (int)SendMessageW(ui.log, EM_GETLINECOUNT, 0, 0));
-    int first = (int)SendMessageW(ui.log, EM_GETFIRSTVISIBLELINE, 0, 0);
-    int visible = std::max(1, (int)(r.bottom - r.top) / log_line_height());
-    bool changed = total != g_sb.total || first != g_sb.first || visible != g_sb.visible;
-    g_sb.total = total;
-    g_sb.first = first;
-    g_sb.visible = visible;
-    if (changed && ui.scroll) InvalidateRect(ui.scroll, nullptr, FALSE);
-    return changed;
-}
-
-static bool sb_thumb(RECT& t) {
-    RECT r;
-    GetClientRect(ui.scroll, &r);
-    int h = r.bottom - r.top;
-    if (g_sb.total <= g_sb.visible || h <= 0) return false;
-    int th = std::max(S(28), h * g_sb.visible / g_sb.total);
-    int range = std::max(1, g_sb.total - g_sb.visible);
-    int y = (h - th) * std::min(g_sb.first, range) / range;
-    t = {0, y, r.right, y + th};
-    return true;
-}
-
-static void sb_scroll_to(int line) {
-    int range = std::max(0, g_sb.total - g_sb.visible);
-    line = std::max(0, std::min(range, line));
-    int first = (int)SendMessageW(ui.log, EM_GETFIRSTVISIBLELINE, 0, 0);
-    if (line != first) SendMessageW(ui.log, EM_LINESCROLL, 0, line - first);
-    sb_update();
-}
-
-static LRESULT CALLBACK ScrollProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
-    switch (m) {
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(h, &ps);
-        RECT rc;
-        GetClientRect(h, &rc);
-        {
-            MemDC mem(hdc, rc.right, rc.bottom);
-            fill(mem.dc, rc, C::field);
-            RECT t;
-            if (sb_thumb(t)) {
-                bool big = g_sb.hot || g_sb.drag;
-                int w = big ? S(6) : S(4);
-                RECT p{rc.right - S(3) - w, t.top + S(2), rc.right - S(3), t.bottom - S(2)};
-                rrect(mem.dc, p, w / 2, g_sb.drag ? RGB(120, 130, 150) : big ? RGB(92, 100, 118) : RGB(58, 64, 78), CLR_NONE);
-            }
-        }
-        EndPaint(h, &ps);
-        return 0;
-    }
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_MOUSEMOVE: {
-        if (!g_sb.hot) {
-            g_sb.hot = true;
-            TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0};
-            TrackMouseEvent(&t);
-            InvalidateRect(h, nullptr, FALSE);
-        }
-        if (g_sb.drag) {
-            RECT rc, t;
-            GetClientRect(h, &rc);
-            if (sb_thumb(t)) {
-                int th = t.bottom - t.top, track = std::max(1, (int)rc.bottom - th);
-                int y = GET_Y_LPARAM(lp) - g_sb.grab;
-                sb_scroll_to((int)((long long)y * (g_sb.total - g_sb.visible) / track));
-            }
-        }
-        return 0;
-    }
-    case WM_MOUSELEAVE:
-        g_sb.hot = false;
-        InvalidateRect(h, nullptr, FALSE);
-        return 0;
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONDBLCLK: {
-        RECT t;
-        if (!sb_thumb(t)) return 0;
-        int y = GET_Y_LPARAM(lp);
-        if (y >= t.top && y < t.bottom) {
-            g_sb.drag = true;
-            g_sb.grab = y - t.top;
-            SetCapture(h);
-        } else sb_scroll_to(g_sb.first + (y < t.top ? -g_sb.visible : g_sb.visible));
-        InvalidateRect(h, nullptr, FALSE);
-        return 0;
-    }
-    case WM_LBUTTONUP:
-    case WM_CAPTURECHANGED:
-        if (g_sb.drag) {
-            g_sb.drag = false;
-            if (m == WM_LBUTTONUP) ReleaseCapture();
-            InvalidateRect(h, nullptr, FALSE);
-        }
-        return 0;
-    case WM_MOUSEWHEEL:
-        return SendMessageW(ui.log, m, wp, lp);
-    }
-    return DefWindowProcW(h, m, wp, lp);
-}
-
-static LRESULT CALLBACK LogProc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
-    LRESULT r = DefSubclassProc(h, m, wp, lp);
-    switch (m) {
-    case WM_MOUSEWHEEL: case WM_KEYDOWN: case WM_VSCROLL: case WM_SIZE: case WM_MOUSEMOVE: case WM_LBUTTONDOWN:
-    case EM_REPLACESEL: case EM_SCROLLCARET: case EM_LINESCROLL: case WM_SETTEXT: case WM_SETFONT: case EM_SETSEL:
-        sb_update();
-        break;
-    }
-    return r;
-}
-
 static HWND mk(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD ex = 0) {
     return CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, g_hwnd, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
 }
 
-static HWND mkbtn(const wchar_t* text, int id, int kind, wchar_t icon) {
-    HWND h = mk(WC_BUTTONW, text, BS_OWNERDRAW | WS_TABSTOP, id);
-    g_btn[h] = BtnInfo{kind, icon, false};
+static HWND mkbtn(const wchar_t* text, int id, int kind, wchar_t icon, bool tab = true) {
+    HWND h = mk(WC_BUTTONW, text, BS_OWNERDRAW | (tab ? WS_TABSTOP : 0), id);
+    g_btn[h] = BtnInfo{kind, icon, false, false};
     SetWindowSubclass(h, BtnProc, 1, 0);
     return h;
 }
@@ -2308,35 +2409,30 @@ static void init_dark_mode() {
 }
 
 static void create_controls() {
+    ui.bmin = mkbtn(L"", IDC_MIN, BK_CAP, 0xE921, false);
+    ui.bmax = mkbtn(L"", IDC_MAX, BK_CAP, 0xE922, false);
+    ui.bclose = mkbtn(L"", IDC_CLOSE, BK_CAPCLOSE, 0xE8BB, false);
     ui.drives = mk(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP | WS_VSCROLL, IDC_DRIVES);
     ui.refresh = mkbtn(L"", IDC_REFRESH, BK_ICON, 0xE72C);
-    ui.format = mkbtn(L"Formater", IDC_FORMAT, BK_DANGER, 0xE74D);
-    ui.eject = mkbtn(L"Éjecter", IDC_EJECT, BK_GHOST, 0xE898);
     ui.driveinfo = mk(WC_STATICW, L"", SS_OWNERDRAW, IDC_DRIVEINFO);
     ui.version = mk(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_TABSTOP | WS_VSCROLL, IDC_VERSION);
     ui.archives = mkbtn(L"", IDC_ARCHIVES, BK_ICON, 0xE895);
     ui.site = mkbtn(L"", IDC_SITE, BK_ICON, 0xE774);
-    ui.cache = mkbtn(L"", IDC_CACHE, BK_ICON, 0xE8B7);
-    ui.source = mk(WC_STATICW, L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, IDC_SOURCE);
-    ui.sha = mk(WC_STATICW, L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, IDC_SHA);
-    ui.drop = mkbtn(L"", IDC_LOCAL, BK_DROP, 0xE896);
-    ui.status = mk(WC_STATICW, L"Prêt", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, IDC_STATUS);
-    ui.detail = mk(WC_STATICW, L"", SS_RIGHT | SS_NOPREFIX | SS_ENDELLIPSIS, IDC_DETAIL);
+    ui.file = mkbtn(L"", IDC_FILE, BK_FIELD, 0xE896);
+    ui.select = mkbtn(L"Sélection", IDC_SELECT, BK_GHOST, 0xE838);
+    ui.sha = mk(WC_STATICW, L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS | SS_NOTIFY, IDC_SHA);
     ui.progress = mk(WC_STATICW, L"", SS_OWNERDRAW, IDC_PROGRESS);
-    ui.start = mkbtn(L"Préparer la clé", IDC_START, BK_PRIMARY, 0xE88E);
-    ui.cancel = mkbtn(L"Annuler", IDC_CANCEL, BK_GHOST, 0xE711);
+    ui.detail = mk(WC_STATICW, L"", SS_CENTER | SS_NOPREFIX | SS_ENDELLIPSIS, IDC_DETAIL);
+    ui.logbtn = mkbtn(L"", IDC_LOGBTN, BK_ICON, 0xE81C);
+    ui.cache = mkbtn(L"", IDC_CACHE, BK_ICON, 0xE8B7);
+    ui.format = mkbtn(L"", IDC_FORMAT, BK_DANGER, 0xE74D);
+    ui.eject = mkbtn(L"", IDC_EJECT, BK_ICON, 0xE898);
+    ui.devbtn = mkbtn(L"", IDC_DEV, BK_ICON, 0xEC7A);
+    ui.start = mkbtn(L"Préparer", IDC_START, BK_PRIMARY, 0xE88E);
+    ui.cancel = mkbtn(L"Annuler", IDC_CANCEL, BK_GHOST, 0);
     ui.log = mk(WC_EDITW, L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG);
-    SetWindowSubclass(ui.log, LogProc, 3, 0);
-    WNDCLASSW sc{};
-    sc.lpfnWndProc = ScrollProc;
-    sc.hInstance = GetModuleHandleW(nullptr);
-    sc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    sc.style = CS_DBLCLKS;
-    sc.lpszClassName = L"PSDScrollBar";
-    RegisterClassW(&sc);
-    ui.scroll = mk(L"PSDScrollBar", L"", 0, 0);
     SendMessageW(ui.log, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
-    SendMessageW(ui.log, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(2, 2));
+    ui.scroll = attach_scroll(g_hwnd, ui.log, IDC_SCROLL);
     for (HWND cb : {ui.drives, ui.version}) {
         dark(cb, L"DarkMode_CFD");
         SetWindowSubclass(cb, ComboProc, 2, 0);
@@ -2345,19 +2441,48 @@ static void create_controls() {
     }
     ui.tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, 0, 0, 0, 0, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     dark(ui.tip, L"DarkMode_Explorer");
-    add_tip(ui.refresh, L"Rechercher les clés USB");
+    add_tip(ui.refresh, L"Rechercher les clés USB (F5)");
     add_tip(ui.archives, L"Actualiser le catalogue des firmwares");
     add_tip(ui.site, L"Ouvrir l'archive Darthsternie");
+    add_tip(ui.file, L"Choisir un .PUP (Ctrl+O, ou glisse-le dans la fenêtre)");
+    add_tip(ui.logbtn, L"Afficher / masquer le journal (Ctrl+L)");
     add_tip(ui.cache, L"Ouvrir le dossier de cache");
     add_tip(ui.format, L"Formater la clé en exFAT (efface tout)");
-    add_tip(ui.eject, L"Retirer la clé en toute sécurité");
-    reset_drop();
+    add_tip(ui.eject, L"Éjecter la clé en toute sécurité");
+    add_tip(ui.devbtn, L"Outils développeur (Ctrl+Maj+D)");
+    add_tip(ui.sha, L"Cliquer pour copier");
+    add_tip(ui.bmin, L"Réduire");
+    add_tip(ui.bmax, L"Agrandir");
+    add_tip(ui.bclose, L"Fermer");
+}
+
+static void apply_shape() {
+    if (ui.win11) return;
+    RECT r;
+    GetWindowRect(g_hwnd, &r);
+    if (IsZoomed(g_hwnd)) SetWindowRgn(g_hwnd, nullptr, TRUE);
+    else SetWindowRgn(g_hwnd, CreateRoundRectRgn(0, 0, r.right - r.left + 1, r.bottom - r.top + 1, S(16), S(16)), TRUE);
 }
 
 static void apply_dpi(UINT dpi) {
     ui.dpi = dpi;
     make_fonts();
     layout();
+}
+
+static void toggle_log() {
+    ui.log_visible = !ui.log_visible;
+    if (!IsZoomed(g_hwnd)) {
+        RECT r;
+        GetWindowRect(g_hwnd, &r);
+        int target = content_height(ui.log_visible);
+        RECT c;
+        GetClientRect(g_hwnd, &c);
+        int delta = target - c.bottom;
+        if (!ui.log_visible || delta > 0) SetWindowPos(g_hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top + delta, SWP_NOMOVE | SWP_NOZORDER);
+    }
+    layout();
+    if (ui.log_visible) SendMessageW(ui.log, EM_SCROLLCARET, 0, 0);
 }
 
 static void on_done(DoneInfo* d) {
@@ -2381,7 +2506,6 @@ static void on_done(DoneInfo* d) {
                 set_status(L"Clé prête et vérifiée", C::ok);
                 set_text(ui.detail, d->msg);
                 log_line(L"Succès : " + d->msg);
-                update_fw_info();
                 fill_versions();
                 if (ask(L"Firmware copié et relu depuis la clé :\n" + d->msg +
                             L"\n\nSur la PS5 : Paramètres › Système › Logiciel système › Mise à jour › Mettre à jour depuis une clé USB.\n\nÉjecter la clé maintenant ?",
@@ -2413,6 +2537,668 @@ static void on_done(DoneInfo* d) {
     }
 }
 
+
+enum { JOB_DEV = 20 };
+enum {
+    IDD_CLOSE = 300, IDD_SIMDL, IDD_SIMERR, IDD_CRASH_CPP, IDD_CRASH_AV, IDD_CRASH_SO, IDD_NET, IDD_BENCH, IDD_SYSINFO,
+    IDD_EXPORT, IDD_CRASHDIR, IDD_LASTCRASH, IDD_CLEARCACHE, IDD_DOWNLOADS, IDD_LOG, IDD_SCROLL, IDD_CLEARLOG
+};
+
+struct Dev {
+    HWND wnd = nullptr, log = nullptr, scroll = nullptr, close = nullptr;
+    std::vector<std::pair<HWND, int>> grid;
+    std::vector<Label> labels;
+    RECT logField{};
+    int captionH = 0;
+} dev;
+
+
+static std::wstring known_folder(REFKNOWNFOLDERID id) {
+    PWSTR p = nullptr;
+    std::wstring r;
+    if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &p))) r = p;
+    if (p) CoTaskMemFree(p);
+    return r;
+}
+
+static std::wstring crash_dir() { return g_cache + L"\\crash"; }
+
+static const wchar_t* exception_name(DWORD c) {
+    switch (c) {
+    case EXCEPTION_ACCESS_VIOLATION: return L"violation d'accès";
+    case EXCEPTION_STACK_OVERFLOW: return L"débordement de pile";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO: return L"division par zéro";
+    case EXCEPTION_ILLEGAL_INSTRUCTION: return L"instruction illégale";
+    case EXCEPTION_IN_PAGE_ERROR: return L"erreur de page";
+    case EXCEPTION_BREAKPOINT: return L"point d'arrêt";
+    case 0xC0000409: return L"fail-fast / pile corrompue";
+    default: return L"exception système";
+    }
+}
+
+static std::wstring os_version() {
+    using RtlFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+    OSVERSIONINFOW v{sizeof v};
+    if (auto f = (RtlFn)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")) f(&v);
+    return F(L"Windows %lu.%lu build %lu%ls", v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber, v.dwBuildNumber >= 22000 ? L" (Windows 11)" : L"");
+}
+
+struct CrashCtx {
+    EXCEPTION_POINTERS* ep;
+    std::wstring reason;
+    DWORD tid;
+};
+
+static DWORD WINAPI crash_writer(LPVOID p) {
+    auto* c = (CrashCtx*)p;
+    make_dirs(crash_dir());
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    std::wstring base = crash_dir() + F(L"\\crash_%04d%02d%02d_%02d%02d%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    std::wstring txt = std::wstring(L"PSD ") + APP_VER + L" — rapport de crash\r\n";
+    txt += F(L"Date    : %04d-%02d-%02d %02d:%02d:%02d\r\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    txt += L"Cause   : " + c->reason + L"\r\n";
+    txt += F(L"Thread  : %lu\r\n", c->tid);
+    txt += L"Système : " + os_version() + L"\r\n";
+    if (c->ep && c->ep->ExceptionRecord) {
+        auto* er = c->ep->ExceptionRecord;
+        txt += F(L"Code    : 0x%08lX (%ls)\r\n", er->ExceptionCode, exception_name(er->ExceptionCode));
+        txt += F(L"Adresse : 0x%p\r\n", er->ExceptionAddress);
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)er->ExceptionAddress, &mod)) {
+            wchar_t name[MAX_PATH]{};
+            GetModuleFileNameW(mod, name, MAX_PATH);
+            txt += F(L"Module  : %ls +0x%llX\r\n", name, (unsigned long long)((BYTE*)er->ExceptionAddress - (BYTE*)mod));
+        }
+        if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+            txt += F(L"Accès   : %ls à 0x%llX\r\n", er->ExceptionInformation[0] == 1 ? L"écriture" : er->ExceptionInformation[0] == 8 ? L"exécution" : L"lecture",
+                     (unsigned long long)er->ExceptionInformation[1]);
+    }
+    txt += L"\r\n--- Journal ---\r\n" + g_log_mirror;
+    std::string u = "\xEF\xBB\xBF" + U(txt);
+    {
+        Handle f(CreateFileW((base + L".txt").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr));
+        DWORD wr = 0;
+        if (f.ok()) WriteFile(f.h, u.data(), (DWORD)u.size(), &wr, nullptr);
+    }
+    if (HMODULE dbg = LoadLibraryExW(L"dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        using DumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+        if (auto dump = (DumpFn)(void*)GetProcAddress(dbg, "MiniDumpWriteDump")) {
+            Handle f(CreateFileW((base + L".dmp").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr));
+            if (f.ok()) {
+                MINIDUMP_EXCEPTION_INFORMATION mei{c->tid, c->ep, FALSE};
+                dump(GetCurrentProcess(), GetCurrentProcessId(), f.h, (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory),
+                     c->ep ? &mei : nullptr, nullptr, nullptr);
+            }
+        }
+    }
+    std::wstring msg = L"PSD a planté : " + c->reason + L".\n\nRapport et minidump enregistrés :\n" + base + L".txt";
+    MessageBoxW(nullptr, msg.c_str(), L"PSD — crash", MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    return 0;
+}
+
+static void write_crash(EXCEPTION_POINTERS* ep, const std::wstring& reason) {
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) return;
+    CrashCtx c{ep, reason, GetCurrentThreadId()};
+    HANDLE th = CreateThread(nullptr, 512 * 1024, crash_writer, &c, 0, nullptr);
+    if (th) {
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+    }
+}
+
+static LONG WINAPI seh_filter(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    write_crash(ep, exception_name(code));
+    TerminateProcess(GetCurrentProcess(), code ? code : 1);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static LONG WINAPI veh_stack(EXCEPTION_POINTERS* ep) {
+    if (ep && ep->ExceptionRecord && ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+        write_crash(ep, exception_name(EXCEPTION_STACK_OVERFLOW));
+        TerminateProcess(GetCurrentProcess(), EXCEPTION_STACK_OVERFLOW);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void terminate_handler() {
+    std::wstring r = L"exception C++ non capturée";
+    try {
+        if (auto e = std::current_exception()) std::rethrow_exception(e);
+    } catch (std::exception& x) {
+        r += L" (" + W(x.what()) + L")";
+    } catch (...) {
+    }
+    write_crash(nullptr, r);
+    TerminateProcess(GetCurrentProcess(), 3);
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winfinite-recursion"
+__attribute__((noinline)) static int recurse(int n) {
+    volatile char buf[2048];
+    buf[n % 2048] = (char)n;
+    return recurse(n + 1) + buf[0];
+}
+#pragma GCC diagnostic pop
+
+static void dev_log(const std::wstring& s) { log_line(L"[dev] " + s); }
+
+static void trigger_crash(int kind) {
+    const wchar_t* names[] = {L"exception C++ non capturée", L"violation d'accès (écriture à 0x0)", L"débordement de pile (récursion infinie)"};
+    if (MessageBoxW(dev.wnd, (std::wstring(L"Déclencher un crash volontaire : ") + names[kind] + L" ?\n\nPSD va se fermer et écrire un rapport + minidump dans :\n" + crash_dir()).c_str(),
+                    L"Crash volontaire", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+        return;
+    dev_log(std::wstring(L"Crash volontaire demandé : ") + names[kind]);
+    std::thread([kind] {
+        Sleep(150);
+        if (kind == 0) throw std::runtime_error("crash volontaire depuis le panneau dev");
+        if (kind == 1) {
+            volatile int* p = nullptr;
+            *p = 0x5053;
+        }
+        if (kind == 2) {
+            ULONG g = 64 * 1024;
+            SetThreadStackGuarantee(&g);
+            recurse(0);
+        }
+    }).detach();
+}
+
+static void xorshift_fill(BYTE* p, size_t n, uint64_t& st) {
+    uint64_t* q = (uint64_t*)p;
+    for (size_t i = 0; i < n / 8; i++) {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        q[i] = st;
+    }
+}
+
+static std::wstring sim_download() {
+    std::wstring dl = known_folder(FOLDERID_Downloads);
+    if (dl.empty()) fail(L"Dossier Téléchargements introuvable");
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    std::wstring fin = dl + F(L"\\PSD_simulation_%02d%02d%02d.bin", t.wHour, t.wMinute, t.wSecond), part = fin + L".part";
+    const uint64_t total = 256 * MiB;
+    post_log(L"[dev] Téléchargement simulé → " + fin);
+    Handle out(CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (!out.ok()) fail(L"Écriture impossible : " + win_error(GetLastError()));
+    struct Guard {
+        std::wstring p;
+        bool armed = true;
+        ~Guard() { if (armed) DeleteFileW(p.c_str()); }
+    } guard{part};
+    AlignedBuf buf(MiB);
+    uint64_t st = 0x9E3779B97F4A7C15ull ^ GetTickCount64(), n = 0;
+    Meter m(L"Téléchargement simulé", total);
+    bool dropped = false;
+    while (n < total) {
+        check_cancel();
+        if (!dropped && n >= total * 2 / 5) {
+            dropped = true;
+            post_log(F(L"[dev] Tentative 1/8 : coupure réseau simulée à %ls", human(n).c_str()));
+            post_prog(L"Reconnexion…", 0, 0, L"Coupure simulée, reprise HTTP Range dans 2 s");
+            sleep_cancellable(2);
+            post_log(F(L"[dev] Reprise HTTP Range : bytes=%llu-", (unsigned long long)n));
+        }
+        xorshift_fill(buf.p, MiB, st);
+        if (n == 0) memcpy(buf.p, "SLB2", 4);
+        DWORD wr = 0;
+        if (!WriteFile(out.h, buf.p, (DWORD)MiB, &wr, nullptr) || wr != MiB) fail(L"Écriture : " + win_error(GetLastError()));
+        n += MiB;
+        m.tick(n);
+        double speed = 25.0 + 35.0 * (0.5 + 0.5 * std::sin((double)n / (16.0 * MiB)));
+        Sleep((DWORD)(1000.0 / speed));
+    }
+    m.tick(n, true);
+    FlushFileBuffers(out.h);
+    out.close();
+    if (!MoveFileExW(part.c_str(), fin.c_str(), MOVEFILE_REPLACE_EXISTING)) fail(L"Renommage : " + win_error(GetLastError()));
+    guard.armed = false;
+    std::string sha = hash_file(fin, false, L"SHA-256 du fichier simulé");
+    post_log(L"[dev] SHA-256 : " + W(sha));
+    return L"Téléchargement simulé terminé : " + fin.substr(fin.find_last_of(L'\\') + 1);
+}
+
+static std::wstring sim_error() {
+    post_prog(L"Opération simulée…", 0, 0, L"Échec prévu dans 2 secondes");
+    post_log(L"[dev] Opération simulée lancée");
+    sleep_cancellable(2);
+    fail(L"Erreur simulée : le serveur a répondu HTTP 503 Service Unavailable.\n(Test de la gestion d'erreur, rien n'a été modifié.)");
+}
+
+static std::wstring net_test() {
+    std::vector<std::pair<const wchar_t*, std::wstring>> urls = {
+        {L"Darthsternie", D_ARCHIVE}, {L"Midnight Channel", M_ARCHIVE}, {L"PUP 13.60 (HTTPS)", builtin_catalog()[L"13.60.00"].direct}};
+    int ok = 0;
+    for (size_t i = 0; i < urls.size(); i++) {
+        check_cancel();
+        post_prog(L"Test réseau", i, urls.size(), urls[i].first);
+        ULONGLONG t0 = GetTickCount64();
+        try {
+            Req q;
+            http_open(q, urls[i].second, L"");
+            ULONGLONG dt = GetTickCount64() - t0;
+            std::wstring len = q.header(WINHTTP_QUERY_CONTENT_LENGTH), type = q.header(WINHTTP_QUERY_CONTENT_TYPE);
+            post_log(F(L"[dev] %ls : HTTP %lu en %llu ms%ls%ls", urls[i].first, q.status, (unsigned long long)dt, type.empty() ? L"" : (L" · " + type).c_str(),
+                       len.empty() ? L"" : (L" · " + human(_wcstoui64(len.c_str(), nullptr, 10))).c_str()));
+            if (q.status < 400) ok++;
+        } catch (AppError& e) {
+            post_log(F(L"[dev] %ls : échec en %llu ms — ", urls[i].first, (unsigned long long)(GetTickCount64() - t0)) + e.msg);
+        }
+    }
+    return F(L"Test réseau : %d/%d serveur(s) joignable(s)", ok, (int)urls.size());
+}
+
+static std::wstring bench() {
+    const DWORD chunk = 8 * 1024 * 1024;
+    const int rounds = 64;
+    AlignedBuf buf(chunk);
+    uint64_t st = 0x1234567ull;
+    xorshift_fill(buf.p, chunk, st);
+    auto run = [&](LPCWSTR alg, const wchar_t* name) {
+        Hasher h(alg);
+        Meter m(std::wstring(L"Benchmark ") + name, (uint64_t)chunk * rounds);
+        LARGE_INTEGER f, a, b;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
+        for (int i = 0; i < rounds; i++) {
+            check_cancel();
+            h.update(buf.p, chunk);
+            m.tick((uint64_t)chunk * (i + 1));
+        }
+        h.hex();
+        QueryPerformanceCounter(&b);
+        double s = (double)(b.QuadPart - a.QuadPart) / f.QuadPart;
+        double mbs = (double)chunk * rounds / MiB / s;
+        post_log(F(L"[dev] %ls : %.0f Mio/s (512 Mio en %.2f s)", name, mbs, s));
+        return mbs;
+    };
+    double a = run(BCRYPT_SHA256_ALGORITHM, L"SHA-256");
+    run(BCRYPT_MD5_ALGORITHM, L"MD5");
+    return F(L"Benchmark : SHA-256 à %.0f Mio/s · un PUP de 1.16 Gio se vérifie en ~%.1f s", a, 1190.0 / a);
+}
+
+static uint64_t dir_size(const std::wstring& dir) {
+    uint64_t total = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        std::wstring n = fd.cFileName;
+        if (n == L"." || n == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) total += dir_size(dir + L"\\" + n);
+        else total += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    return total;
+}
+
+static void sys_info() {
+    dev_log(L"Système : " + os_version() + (ui.win11 ? L" · coins DWM" : L" · coins par région"));
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    MEMORYSTATUSEX ms{sizeof ms};
+    GlobalMemoryStatusEx(&ms);
+    dev_log(F(L"Processeurs : %lu · RAM : %ls (libre %ls)", si.dwNumberOfProcessors, human(ms.ullTotalPhys).c_str(), human(ms.ullAvailPhys).c_str()));
+    dev_log(F(L"DPI : %u (%d %%) · police : %ls · icônes : %ls · mono : %ls", ui.dpi, ui.dpi * 100 / 96, ui.uiFont.c_str(), ui.iconFont.c_str(), ui.monoFont.c_str()));
+    ULARGE_INTEGER fa{};
+    GetDiskFreeSpaceExW(g_cache.substr(0, 3).c_str(), &fa, nullptr, nullptr);
+    dev_log(L"Cache : " + g_cache + L" · " + human(dir_size(g_cache)) + L" · disque libre " + human(fa.QuadPart));
+    std::wstring mega = megacmd();
+    dev_log(L"MEGAcmd : " + (mega.empty() ? std::wstring(L"absent") : mega));
+    dev_log(F(L"Catalogue : %d version(s) · clés USB : %d · exe : ", (int)g_catalog.size(), (int)g_drives.size()) + g_exe_dir);
+}
+
+static void export_log() {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t file[MAX_PATH * 2]{};
+    wcscpy(file, F(L"PSD_journal_%04d%02d%02d_%02d%02d.txt", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute).c_str());
+    std::wstring docs = known_folder(FOLDERID_Documents);
+    OPENFILENAMEW of{};
+    of.lStructSize = sizeof of;
+    of.hwndOwner = dev.wnd;
+    of.lpstrFilter = L"Texte (*.txt)\0*.txt\0";
+    of.lpstrFile = file;
+    of.nMaxFile = MAX_PATH * 2;
+    of.lpstrInitialDir = docs.c_str();
+    of.lpstrDefExt = L"txt";
+    of.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&of)) return;
+    std::string u = "\xEF\xBB\xBF" + U(g_log_mirror);
+    Handle f(CreateFileW(file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr));
+    DWORD wr = 0;
+    if (f.ok() && WriteFile(f.h, u.data(), (DWORD)u.size(), &wr, nullptr)) dev_log(std::wstring(L"Journal exporté : ") + file);
+    else dev_log(L"Export impossible : " + win_error(GetLastError()));
+}
+
+static std::wstring last_crash_report() {
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((crash_dir() + L"\\crash_*.txt").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    std::wstring best;
+    do {
+        if (best.empty() || wcscmp(fd.cFileName, best.c_str()) > 0) best = fd.cFileName;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    return best.empty() ? best : crash_dir() + L"\\" + best;
+}
+
+static void clear_cache() {
+    if (g_busy) { MessageBoxW(dev.wnd, L"Une opération est en cours.", APP_NAME, MB_ICONWARNING); return; }
+    uint64_t before = dir_size(g_cache);
+    if (MessageBoxW(dev.wnd, (L"Supprimer les firmwares en cache (" + human(before) + L") ?\nLes rapports de crash sont conservés.").c_str(), L"Vider le cache", MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((g_cache + L"\\*").c_str(), &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            std::wstring n = fd.cFileName;
+            if (n == L"." || n == L".." || n == L"crash") continue;
+            std::wstring p = g_cache + L"\\" + n;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(p);
+            else DeleteFileW(p.c_str());
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    dev_log(L"Cache vidé : " + human(before - std::min(before, dir_size(g_cache))) + L" libérés");
+    fill_versions();
+}
+
+static void dev_layout() {
+    if (!dev.log || dev.grid.size() < 14) return;
+    RECT rc;
+    GetClientRect(dev.wnd, &rc);
+    int W = rc.right, m = S(16), cw = W - 2 * m, gap = S(8), bh = S(32);
+    dev.captionH = S(40);
+    dev.labels.clear();
+    MoveWindow(dev.close, W - S(46), 0, S(46), S(32), FALSE);
+    int y = dev.captionH + S(10);
+    size_t gi = 0;
+    auto section = [&](const wchar_t* t) {
+        dev.labels.push_back({{m, y, m + cw, y + S(22)}, t, true});
+        y += S(30);
+    };
+    auto row = [&](int cols) {
+        int w = (cw - gap * (cols - 1)) / cols;
+        for (int c = 0; c < cols && gi < dev.grid.size(); c++, gi++) MoveWindow(dev.grid[gi].first, m + c * (w + gap), y, w, bh, FALSE);
+        y += bh + gap;
+    };
+    section(L"Simulation");
+    row(2);
+    y += S(6);
+    section(L"Crash volontaire");
+    row(3);
+    dev.labels.push_back({{m, y - S(4), m + cw, y + S(12)}, L"Rapport texte + minidump écrits dans le dossier des crashs", false});
+    y += S(20);
+    section(L"Diagnostic");
+    row(2);
+    row(2);
+    y += S(6);
+    section(L"Fichiers");
+    row(2);
+    row(2);
+    y += S(6);
+    section(L"Console");
+    MoveWindow(dev.grid[gi].first, m + cw - S(90), y - S(30) - S(4), S(90), S(26), FALSE);
+    dev.logField = {m, y, m + cw, std::max(y + S(80), (int)rc.bottom - m)};
+    int lw = dev.logField.right - dev.logField.left, lh = dev.logField.bottom - dev.logField.top;
+    MoveWindow(dev.log, dev.logField.left + S(10), dev.logField.top + S(8), lw - S(28), lh - S(14), FALSE);
+    MoveWindow(dev.scroll, dev.logField.right - S(14), dev.logField.top + S(4), S(12), lh - S(8), FALSE);
+    RedrawWindow(dev.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    sb_update(dev.scroll);
+}
+
+static void dev_paint(HDC hdc) {
+    RECT rc;
+    GetClientRect(dev.wnd, &rc);
+    MemDC mem(hdc, rc.right, rc.bottom);
+    HDC dc = mem.dc;
+    fill(dc, rc, C::bg);
+    fill(dc, {0, 0, rc.right, dev.captionH}, C::caption);
+    fill(dc, {0, dev.captionH - 1, rc.right, dev.captionH}, C::border);
+    draw_text(dc, L"\xEC7A", {S(14), 0, S(36), dev.captionH}, ui.icon, C::section, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    draw_text(dc, L"Outils développeur", {S(42), 0, rc.right - S(60), dev.captionH}, ui.title, C::text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    for (auto& l : dev.labels) {
+        if (l.section) {
+            int w = text_width(dc, l.text, ui.semi);
+            draw_text(dc, l.text, l.r, ui.semi, C::text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            int ly = (l.r.top + l.r.bottom) / 2;
+            Gdiplus::Graphics g(dc);
+            Gdiplus::LinearGradientBrush lb(Gdiplus::PointF((float)l.r.left + w + S(10), 0), Gdiplus::PointF((float)l.r.right + 1, 0), GC(C::accent), GC(C::bg));
+            g.FillRectangle(&lb, (float)l.r.left + w + S(10), (float)ly, (float)(l.r.right - l.r.left - w - S(10)), 1.0f);
+        } else draw_text(dc, l.text, l.r, ui.small, C::faint, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    rrect(dc, dev.logField, S(8), C::field, C::fieldBorder);
+    if (!ui.win11) rrect(dc, {0, 0, rc.right, rc.bottom}, S(8), CLR_NONE, C::border);
+}
+
+static void dev_apply_shape() {
+    if (ui.win11 || !dev.wnd) return;
+    RECT r;
+    GetWindowRect(dev.wnd, &r);
+    SetWindowRgn(dev.wnd, CreateRoundRectRgn(0, 0, r.right - r.left + 1, r.bottom - r.top + 1, S(16), S(16)), TRUE);
+}
+
+static bool dev_busy_guard() {
+    if (!g_busy) return false;
+    MessageBoxW(dev.wnd, L"Une opération est déjà en cours.", APP_NAME, MB_ICONWARNING);
+    return true;
+}
+
+static LRESULT CALLBACK DevProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_NCCALCSIZE:
+        if (wp) return 0;
+        break;
+    case WM_NCACTIVATE:
+        return DefWindowProcW(h, msg, wp, -1);
+    case WM_NCHITTEST: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(h, &pt);
+        RECT rc;
+        GetClientRect(h, &rc);
+        int b = S(6);
+        bool l = pt.x < b, r = pt.x >= rc.right - b, t = pt.y < b, btm = pt.y >= rc.bottom - b;
+        if (btm && l) return HTBOTTOMLEFT;
+        if (btm && r) return HTBOTTOMRIGHT;
+        if (l) return HTLEFT;
+        if (r) return HTRIGHT;
+        if (btm) return HTBOTTOM;
+        if (t) return HTTOP;
+        if (pt.y < dev.captionH) return HTCAPTION;
+        return HTCLIENT;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        dev_paint(dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_SIZE:
+        dev_apply_shape();
+        dev_layout();
+        return 0;
+    case WM_GETMINMAXINFO: {
+        auto* mm = (MINMAXINFO*)lp;
+        mm->ptMinTrackSize = {S(420), S(600)};
+        return 0;
+    }
+    case WM_DRAWITEM:
+        if (((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) draw_button((DRAWITEMSTRUCT*)lp);
+        return TRUE;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp;
+        SetBkColor(dc, C::field);
+        SetTextColor(dc, RGB(165, 172, 184));
+        return (LRESULT)ui.fieldBrush;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDD_CLOSE: ShowWindow(h, SW_HIDE); break;
+        case IDD_SIMDL: if (!dev_busy_guard()) run_job(JOB_DEV, sim_download); break;
+        case IDD_SIMERR: if (!dev_busy_guard()) run_job(JOB_DEV, sim_error); break;
+        case IDD_CRASH_CPP: trigger_crash(0); break;
+        case IDD_CRASH_AV: trigger_crash(1); break;
+        case IDD_CRASH_SO: trigger_crash(2); break;
+        case IDD_NET: if (!dev_busy_guard()) run_job(JOB_DEV, net_test); break;
+        case IDD_BENCH: if (!dev_busy_guard()) run_job(JOB_DEV, bench); break;
+        case IDD_SYSINFO: sys_info(); break;
+        case IDD_EXPORT: export_log(); break;
+        case IDD_CRASHDIR:
+            make_dirs(crash_dir());
+            ShellExecuteW(h, L"open", crash_dir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case IDD_LASTCRASH: {
+            std::wstring r = last_crash_report();
+            if (r.empty()) dev_log(L"Aucun rapport de crash");
+            else ShellExecuteW(h, L"open", r.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        }
+        case IDD_CLEARCACHE: clear_cache(); break;
+        case IDD_DOWNLOADS: ShellExecuteW(h, L"open", known_folder(FOLDERID_Downloads).c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+        case IDD_CLEARLOG:
+            SetWindowTextW(dev.log, L"");
+            sb_update(dev.scroll);
+            break;
+        }
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(h, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static HWND devbtn(const wchar_t* text, int id, int kind, wchar_t icon) {
+    HWND b = CreateWindowExW(0, WC_BUTTONW, text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10, dev.wnd, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+    g_btn[b] = BtnInfo{kind, icon, false, false};
+    SetWindowSubclass(b, BtnProc, 1, 0);
+    SendMessageW(b, WM_SETFONT, (WPARAM)ui.font, FALSE);
+    return b;
+}
+
+static void open_dev() {
+    if (!dev.wnd) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = DevProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        wc.lpszClassName = L"PSDDev";
+        RegisterClassW(&wc);
+        dev.wnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"PSDDev", L"PSD — outils développeur", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_CLIPCHILDREN, 0, 0, 10, 10,
+                                  g_hwnd, nullptr, wc.hInstance, nullptr);
+        BOOL on = TRUE;
+        DwmSetWindowAttribute(dev.wnd, 20, &on, sizeof on);
+        int corner = 2;
+        DwmSetWindowAttribute(dev.wnd, 33, &corner, sizeof corner);
+        COLORREF bc = C::border;
+        DwmSetWindowAttribute(dev.wnd, 34, &bc, sizeof bc);
+        MARGINS mg{0, 0, 0, 1};
+        DwmExtendFrameIntoClientArea(dev.wnd, &mg);
+        dev.close = devbtn(L"", IDD_CLOSE, BK_CAPCLOSE, 0xE8BB);
+        struct B {
+            const wchar_t* t;
+            int id, kind;
+            wchar_t ic;
+        } list[] = {
+            {L"Téléchargement simulé", IDD_SIMDL, BK_GHOST, 0xE896}, {L"Erreur simulée", IDD_SIMERR, BK_GHOST, 0xE7BA},
+            {L"Exception C++", IDD_CRASH_CPP, BK_DANGER, 0xE943}, {L"Accès mémoire", IDD_CRASH_AV, BK_DANGER, 0xE964}, {L"Pile infinie", IDD_CRASH_SO, BK_DANGER, 0xE81E},
+            {L"Tester le réseau", IDD_NET, BK_GHOST, 0xE774}, {L"Benchmark SHA-256", IDD_BENCH, BK_GHOST, 0xE9D9},
+            {L"Infos système", IDD_SYSINFO, BK_GHOST, 0xE7F4}, {L"Exporter le journal", IDD_EXPORT, BK_GHOST, 0xE74E},
+            {L"Dossier des crashs", IDD_CRASHDIR, BK_GHOST, 0xE8B7}, {L"Dernier rapport", IDD_LASTCRASH, BK_GHOST, 0xE8A5},
+            {L"Vider le cache", IDD_CLEARCACHE, BK_DANGER, 0xE74D}, {L"Téléchargements", IDD_DOWNLOADS, BK_GHOST, 0xE896},
+            {L"Effacer", IDD_CLEARLOG, BK_GHOST, 0xE894},
+        };
+        for (auto& b : list) dev.grid.push_back({devbtn(b.t, b.id, b.kind, b.ic), b.id});
+        dev.log = CreateWindowExW(0, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 10, 10, dev.wnd, (HMENU)(INT_PTR)IDD_LOG, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(dev.log, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
+        SendMessageW(dev.log, WM_SETFONT, (WPARAM)ui.mono, FALSE);
+        dev.scroll = attach_scroll(dev.wnd, dev.log, IDD_SCROLL);
+        g_dev_log = dev.log;
+        std::wstring mirror = g_log_mirror;
+        SetWindowTextW(dev.log, mirror.c_str());
+        SendMessageW(dev.log, EM_SETSEL, mirror.size(), mirror.size());
+        SendMessageW(dev.log, EM_SCROLLCARET, 0, 0);
+        RECT mr;
+        GetWindowRect(g_hwnd, &mr);
+        int w = S(440), h = S(690);
+        HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{sizeof mi};
+        GetMonitorInfoW(mon, &mi);
+        int x = mr.right + S(12);
+        if (x + w > mi.rcWork.right) x = std::max((int)mi.rcWork.left, (int)mr.left - S(12) - w);
+        int y = std::max((int)mi.rcWork.top, std::min((int)mr.top, (int)mi.rcWork.bottom - h));
+        SetWindowPos(dev.wnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED);
+        dev_layout();
+        dev_log(L"Panneau développeur ouvert");
+    }
+    ShowWindow(dev.wnd, SW_SHOWNORMAL);
+    SetForegroundWindow(dev.wnd);
+}
+
+static const wchar_t* REG_KEY = L"Software\\PSD";
+
+static std::wstring reg_get(const wchar_t* name) {
+    wchar_t buf[512]{};
+    DWORD sz = sizeof buf;
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_KEY, name, RRF_RT_REG_SZ, nullptr, buf, &sz) != ERROR_SUCCESS) return {};
+    return buf;
+}
+
+static void reg_set(const wchar_t* name, const std::wstring& v) {
+    RegSetKeyValueW(HKEY_CURRENT_USER, REG_KEY, name, REG_SZ, v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+}
+
+static void copy_sha() {
+    const Firmware* f = selected_fw();
+    if (!f || !is_hex(f->sha256, 64)) return;
+    std::wstring s = W(f->sha256);
+    if (!OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t));
+    if (g) {
+        memcpy(GlobalLock(g), s.c_str(), (s.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(g);
+        SetClipboardData(CF_UNICODETEXT, g);
+    }
+    CloseClipboard();
+    if (!g_busy) set_text(ui.detail, L"SHA-256 copié dans le presse-papiers");
+}
+
+static void check_previous_crash() {
+    std::wstring r = last_crash_report();
+    if (r.empty()) return;
+    std::wstring name = r.substr(r.find_last_of(L'\\') + 1);
+    if (reg_get(L"LastCrashSeen") == name) return;
+    reg_set(L"LastCrashSeen", name);
+    log_line(L"Le lancement précédent a planté. Rapport : " + r);
+}
+
+static bool handle_shortcut(const MSG& m) {
+    if (m.message != WM_KEYDOWN) return false;
+    if (m.hwnd != g_hwnd && !IsChild(g_hwnd, m.hwnd)) return false;
+    bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    if (m.wParam == VK_F5) { scan_drives(); return true; }
+    if (ctrl && !shift && m.wParam == 'O') { if (!g_busy) choose_local(); return true; }
+    if (ctrl && !shift && m.wParam == 'L') { SendMessageW(g_hwnd, WM_COMMAND, IDC_LOGBTN, 0); return true; }
+    if (ctrl && shift && m.wParam == 'D') { open_dev(); return true; }
+    return false;
+}
+
+static int frame_thickness() {
+    return GetSystemMetricsForDpi(SM_CXFRAME, ui.dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, ui.dpi);
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (ui.tbmsg && msg == ui.tbmsg) {
         if (!ui.tb) CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_ITaskbarList3, (void**)&ui.tb);
@@ -2420,28 +3206,69 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     switch (msg) {
+    case WM_NCCALCSIZE:
+        if (wp) {
+            auto* p = (NCCALCSIZE_PARAMS*)lp;
+            if (IsZoomed(h)) {
+                int f = frame_thickness();
+                p->rgrc[0].left += f;
+                p->rgrc[0].top += f;
+                p->rgrc[0].right -= f;
+                p->rgrc[0].bottom -= f;
+            }
+            return 0;
+        }
+        break;
+    case WM_NCACTIVATE:
+        return DefWindowProcW(h, msg, wp, -1);
+    case WM_NCHITTEST: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(h, &pt);
+        RECT rc;
+        GetClientRect(h, &rc);
+        if (!IsZoomed(h)) {
+            int b = S(6);
+            bool l = pt.x < b, r = pt.x >= rc.right - b, t = pt.y < b, btm = pt.y >= rc.bottom - b;
+            if (t && l) return HTTOPLEFT;
+            if (t && r) return HTTOPRIGHT;
+            if (btm && l) return HTBOTTOMLEFT;
+            if (btm && r) return HTBOTTOMRIGHT;
+            if (l) return HTLEFT;
+            if (r) return HTRIGHT;
+            if (t) return HTTOP;
+            if (btm) return HTBOTTOM;
+        }
+        if (pt.y < ui.captionH) return HTCAPTION;
+        return HTCLIENT;
+    }
     case WM_CREATE: {
         g_hwnd = h;
         ui.dpi = GetDpiForWindow(h);
         BOOL on = TRUE;
         DwmSetWindowAttribute(h, 20, &on, sizeof on);
-        COLORREF cap = C::bg;
-        DwmSetWindowAttribute(h, 35, &cap, sizeof cap);
+        int corner = 2;
+        ui.win11 = SUCCEEDED(DwmSetWindowAttribute(h, 33, &corner, sizeof corner));
+        COLORREF bc = C::border;
+        DwmSetWindowAttribute(h, 34, &bc, sizeof bc);
+        MARGINS mg{0, 0, 0, 1};
+        DwmExtendFrameIntoClientArea(h, &mg);
         if (font_exists(L"Segoe UI Variable Text")) ui.uiFont = L"Segoe UI Variable Text";
         if (font_exists(L"Segoe Fluent Icons")) ui.iconFont = L"Segoe Fluent Icons";
         if (font_exists(L"Cascadia Mono")) ui.monoFont = L"Cascadia Mono";
         ui.bgBrush = CreateSolidBrush(C::bg);
-        ui.cardBrush = CreateSolidBrush(C::card);
         ui.fieldBrush = CreateSolidBrush(C::field);
         ui.has_mega = !megacmd().empty();
         create_controls();
         apply_dpi(ui.dpi);
+        if (auto v = reg_get(L"LastVersion"); !v.empty()) g_selected_version = v;
         g_catalog = builtin_catalog();
         fill_versions();
         fill_drives();
         apply_busy();
         log_line(std::wstring(APP_NAME) + L" " + APP_VER + L"  ·  cache : " + g_cache);
         log_line(L"Prépare uniquement une clé de mise à jour officielle : ne contourne aucune restriction PS5.");
+        check_previous_crash();
+        if (reg_get(L"LogVisible") == L"1") PostMessageW(h, WM_COMMAND, IDC_LOGBTN, 0);
         scan_drives();
         load_catalog();
         return 0;
@@ -2456,13 +3283,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
+        apply_shape();
         layout();
+        InvalidateRect(ui.bmax, nullptr, FALSE);
         return 0;
     case WM_GETMINMAXINFO: {
         auto* mm = (MINMAXINFO*)lp;
-        RECT r{0, 0, S(500), S(700)};
-        AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, ui.dpi);
-        mm->ptMinTrackSize = {r.right - r.left, r.bottom - r.top};
+        int minh = content_height(false) + (ui.log_visible ? S(90) : 0);
+        mm->ptMinTrackSize = {S(480), minh};
+        if (!ui.log_visible) mm->ptMaxTrackSize.y = content_height(false);
         return 0;
     }
     case WM_DPICHANGED: {
@@ -2500,12 +3329,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SetTextColor(dc, RGB(165, 172, 184));
             return (LRESULT)ui.fieldBrush;
         }
-        SetBkColor(dc, C::card);
-        COLORREF col = C::dim;
-        if (c == ui.status) col = ui.status_color;
-        else if (c == ui.sha) col = C::faint;
-        SetTextColor(dc, col);
-        return (LRESULT)ui.cardBrush;
+        if (c == ui.sha) {
+            SetBkColor(dc, C::field);
+            SetTextColor(dc, C::dim);
+            return (LRESULT)ui.fieldBrush;
+        }
+        SetBkColor(dc, C::bg);
+        SetTextColor(dc, C::dim);
+        return (LRESULT)ui.bgBrush;
     }
     case WM_COMMAND: {
         int id = LOWORD(wp), code = HIWORD(wp);
@@ -2522,19 +3353,31 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (code == CBN_SELCHANGE) {
                 if (auto f = selected_fw()) {
                     g_selected_version = f->version;
+                    reg_set(L"LastVersion", f->version);
                     if (!g_local_version.empty() && g_local_version != f->version) {
                         g_local_path.clear();
                         g_local_version.clear();
-                        reset_drop();
                     }
                 }
                 update_fw_info();
             }
             break;
+        case IDC_MIN: ShowWindow(h, SW_MINIMIZE); break;
+        case IDC_MAX: ShowWindow(h, IsZoomed(h) ? SW_RESTORE : SW_MAXIMIZE); break;
+        case IDC_CLOSE: PostMessageW(h, WM_CLOSE, 0, 0); break;
         case IDC_REFRESH: scan_drives(); break;
         case IDC_ARCHIVES: load_catalog(); break;
         case IDC_SITE: ShellExecuteW(h, L"open", D_ARCHIVE, nullptr, nullptr, SW_SHOWNORMAL); break;
-        case IDC_LOCAL: if (!g_busy) choose_local(); break;
+        case IDC_FILE:
+        case IDC_SELECT: if (!g_busy) choose_local(); break;
+        case IDC_LOGBTN:
+            toggle_log();
+            reg_set(L"LogVisible", ui.log_visible ? L"1" : L"0");
+            break;
+        case IDC_DEV: open_dev(); break;
+        case IDC_SHA:
+            if (code == STN_CLICKED) copy_sha();
+            break;
         case IDC_START: if (!g_busy) start_prepare(); break;
         case IDC_FORMAT: if (!g_busy) start_format(); break;
         case IDC_EJECT: if (!g_busy) start_eject(); break;
@@ -2581,9 +3424,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PROG: {
         std::unique_ptr<Prog> p((Prog*)lp);
         if (!g_busy) return 0;
-        set_status(p->phase);
+        ui.status = p->phase;
+        ui.status_color = C::text;
         set_text(ui.detail, p->detail);
         set_progress(p->cur, p->total);
+        redraw_bar();
         return 0;
     }
     case WM_DRIVES: {
@@ -2635,6 +3480,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    SetUnhandledExceptionFilter(seh_filter);
+    AddVectoredExceptionHandler(1, veh_stack);
+    std::set_terminate(terminate_handler);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     INITCOMMONCONTROLSEX icc{sizeof icc, ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
@@ -2662,24 +3510,24 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.lpszClassName = L"PS5USBPrepWnd";
+    wc.lpszClassName = L"PSDWnd";
     RegisterClassExW(&wc);
 
     std::wstring title = std::wstring(APP_NAME) + L" " + APP_VER;
-    HWND h = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 540, 780, nullptr, nullptr, inst, nullptr);
+    HWND h = CreateWindowExW(WS_EX_CONTROLPARENT | WS_EX_APPWINDOW, wc.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 520, 700, nullptr, nullptr, inst, nullptr);
     if (!h) return 1;
-    RECT r{0, 0, S(520), S(790)};
-    AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, ui.dpi);
+    int ww = S(500), wh = content_height(false);
     HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{sizeof mi};
     GetMonitorInfoW(mon, &mi);
-    int ww = r.right - r.left, wh = std::min<int>(r.bottom - r.top, mi.rcWork.bottom - mi.rcWork.top);
-    SetWindowPos(h, nullptr, mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - ww) / 2, mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - wh) / 2, ww, wh, SWP_NOZORDER);
+    SetWindowPos(h, nullptr, mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - ww) / 2, mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - wh) / 2, ww, wh, SWP_NOZORDER | SWP_FRAMECHANGED);
     ShowWindow(h, show);
     UpdateWindow(h);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (handle_shortcut(m)) continue;
+        if (dev.wnd && IsDialogMessageW(dev.wnd, &m)) continue;
         if (IsDialogMessageW(h, &m)) continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
