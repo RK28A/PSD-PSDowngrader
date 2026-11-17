@@ -34,7 +34,7 @@ jobs:
           WINEPREFIX: ${{ runner.temp }}/wine
           WINEDLLOVERRIDES: mscoree,mshtml=
         run: |
-          wineboot -i >/dev/null 2>&1 || true
+          $(command -v wine || command -v wine64) wineboot -i >/dev/null 2>&1 || true
           ./tests/run.sh
       - uses: actions/upload-artifact@v4
         with:

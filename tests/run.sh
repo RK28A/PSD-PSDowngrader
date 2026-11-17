@@ -11,4 +11,5 @@ python3 tests/server.py build/cert.pem build/key.pem $PORT > build/server.log 2>
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 for i in 1 2 3 4 5 6 7 8 9 10; do grep -q ready build/server.log && break; sleep 0.5; done
-WINEDEBUG=-all wine build/tests.exe $PORT
+WINE=${WINE:-$(command -v wine || command -v wine64)}
+WINEDEBUG=-all "$WINE" build/tests.exe $PORT
